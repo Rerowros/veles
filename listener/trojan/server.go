@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/metacubex/mihomo/adapter/inbound"
@@ -15,11 +16,14 @@ import (
 	"github.com/metacubex/mihomo/component/ech"
 	C "github.com/metacubex/mihomo/constant"
 	LC "github.com/metacubex/mihomo/listener/config"
+	"github.com/metacubex/mihomo/listener/fallback"
 	"github.com/metacubex/mihomo/listener/jls"
+	"github.com/metacubex/mihomo/listener/preauth"
 	"github.com/metacubex/mihomo/listener/reality"
 	"github.com/metacubex/mihomo/listener/restls"
 	"github.com/metacubex/mihomo/listener/shadowtls"
 	"github.com/metacubex/mihomo/listener/sing"
+	"github.com/metacubex/mihomo/log"
 	"github.com/metacubex/mihomo/ntp"
 	"github.com/metacubex/mihomo/transport/gun"
 	"github.com/metacubex/mihomo/transport/shadowsocks/core"
@@ -80,9 +84,13 @@ func New(config LC.TrojanServer, lc C.InboundListenConfig, tunnel C.Tunnel, addi
 
 	httpServer := http.Server{
 		IdleTimeout: 30 * time.Second,
-		Protocols:   new(http.Protocols),
+		// bounds the TLS handshake and each HTTP/1 request header; the time
+		// to the first request (h2c preface, h2 conn with no stream) is
+		// bounded by preauth.GuardFirstRequest below
+		ReadHeaderTimeout: handshakeTimeout,
+		Protocols:         new(http.Protocols),
 	}
-	tlsConfig := &tls.Config{Time: ntp.Now}
+	tlsConfig := &tls.Config{Time: ntp.Now, MinVersion: tls.VersionTLS12}
 	var shadowTLSBuilder *shadowtls.Builder
 	var restlsBuilder *restls.Builder
 	var jlsBuilder *jls.Builder
@@ -160,9 +168,18 @@ func New(config LC.TrojanServer, lc C.InboundListenConfig, tunnel C.Tunnel, addi
 			return nil, err
 		}
 	}
+	// fallback-page: what a request that is not the inbound's own gets on an HTTP transport.
+	// Only with one: a handler makes the listener serve HTTP, which plain Trojan does not.
+	var page http.Handler
+	if config.FallbackPage != "" && (config.WsPath != "" || config.GrpcServiceName != "") {
+		if page, err = fallback.Page(config.FallbackPage); err != nil {
+			return nil, err
+		}
+	} else if config.FallbackPage != "" {
+		log.Warnln("Trojan inbound %s: fallback-page is ignored without ws-path or grpc-service-name", config.Listen)
+	}
 	if config.WsPath != "" {
-		httpMux := http.NewServeMux()
-		httpMux.HandleFunc(config.WsPath, func(w http.ResponseWriter, r *http.Request) {
+		httpServer.Handler = fallback.WebSocket(config.WsPath, page, func(w http.ResponseWriter, r *http.Request) {
 			conn, err := mihomoVMess.StreamUpgradedWebsocketConn(w, r)
 			if err != nil {
 				http.Error(w, err.Error(), 500)
@@ -170,17 +187,20 @@ func New(config LC.TrojanServer, lc C.InboundListenConfig, tunnel C.Tunnel, addi
 			}
 			sl.HandleConn(conn, tunnel, additions...)
 		})
-		httpServer.Handler = httpMux
 		httpServer.Protocols.SetHTTP1(true)
 		tlsConfig.NextProtos = append(tlsConfig.NextProtos, "http/1.1")
 	}
 	if config.GrpcServiceName != "" {
+		other := httpServer.Handler
+		if other == nil {
+			other = page
+		}
 		httpServer.Handler = gun.NewServerHandler(gun.ServerOption{
 			ServiceName: config.GrpcServiceName,
 			ConnHandler: func(conn net.Conn) {
 				sl.HandleConn(conn, tunnel, additions...)
 			},
-			HttpHandler: httpServer.Handler,
+			HttpHandler: other,
 		})
 		httpServer.Protocols.SetHTTP2(true)
 		// SetUnencryptedHTTP2 to ensure we can work in plain http2 and some tls conn is not *tls.Conn (like *reality.Conn)
@@ -194,6 +214,9 @@ func New(config LC.TrojanServer, lc C.InboundListenConfig, tunnel C.Tunnel, addi
 		tlsConfig.NextProtos = append([]string{"h2"}, tlsConfig.NextProtos...) // h2 must before http/1.1
 	}
 
+	if httpServer.Handler != nil {
+		preauth.GuardFirstRequest(&httpServer, handshakeTimeout)
+	}
 	for _, addr := range strings.Split(config.Listen, ",") {
 		addr := addr
 
@@ -265,6 +288,8 @@ func (l *Listener) AddrList() (addrList []net.Addr) {
 func (l *Listener) HandleConn(conn net.Conn, tunnel C.Tunnel, additions ...inbound.Addition) {
 	defer conn.Close()
 
+	// cleared by handleConn once the request header is read
+	setHandshakeDeadline(conn)
 	if l.pickCipher != nil {
 		conn = l.pickCipher.StreamConn(conn)
 	}
@@ -294,6 +319,9 @@ func (l *Listener) HandleConn(conn net.Conn, tunnel C.Tunnel, additions ...inbou
 func (l *Listener) handleConn(inMux bool, conn net.Conn, tunnel C.Tunnel, additions ...inbound.Addition) {
 	if inMux {
 		defer conn.Close()
+		// a mux stream must send its command and target in time too; the
+		// outer conn's deadline was lifted when the session started
+		setHandshakeDeadline(conn)
 	}
 
 	command, err := socks5.ReadByte(conn)
@@ -322,6 +350,9 @@ func (l *Listener) handleConn(inMux bool, conn net.Conn, tunnel C.Tunnel, additi
 			return
 		}
 	}
+	// the header is read: lift the handshake deadline set by HandleConn, or
+	// above for a mux stream
+	clearHandshakeDeadline(conn)
 
 	switch command {
 	case trojan.CommandTCP:
@@ -364,12 +395,23 @@ func (l *Listener) handleConn(inMux bool, conn net.Conn, tunnel C.Tunnel, additi
 			return
 		}
 		defer session.Close()
+		var streams atomic.Int32
 		for {
 			stream, err := session.AcceptStream()
 			if err != nil {
 				return
 			}
-			go l.handleConn(true, stream, tunnel, additions...)
+			if streams.Load() >= int32(maxMuxStreams) {
+				// too many open streams: refuse this one (the client sees it
+				// closed) rather than stall the session or spawn more
+				_ = stream.Close()
+				continue
+			}
+			streams.Add(1)
+			go func() {
+				defer streams.Add(-1)
+				l.handleConn(true, stream, tunnel, additions...)
+			}()
 		}
 	}
 }

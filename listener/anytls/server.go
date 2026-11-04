@@ -49,7 +49,7 @@ func New(config LC.AnyTLSServer, lc C.InboundListenConfig, tunnel C.Tunnel, addi
 	var shadowTLSBuilder *shadowtls.Builder
 	var restlsBuilder *restls.Builder
 	var jlsBuilder *jls.Builder
-	tlsConfig := &tls.Config{Time: ntp.Now}
+	tlsConfig := &tls.Config{Time: ntp.Now, MinVersion: tls.VersionTLS12}
 	if config.Certificate != "" && config.PrivateKey != "" {
 		certLoader, err := ca.NewTLSKeyPairLoader(config.Certificate, config.PrivateKey)
 		if err != nil {
@@ -210,6 +210,9 @@ func (l *Listener) HandleConn(conn net.Conn, h *sing.ListenerHandler) {
 	b := buf.NewPacket()
 	defer b.Release()
 
+	// cleared once the authentication prelude is read
+	rawConn := conn
+	setHandshakeDeadline(rawConn)
 	_, err := b.ReadOnceFrom(conn)
 	if err != nil {
 		return
@@ -238,14 +241,19 @@ func (l *Listener) HandleConn(conn net.Conn, h *sing.ListenerHandler) {
 			return
 		}
 	}
+	clearHandshakeDeadline(rawConn)
 
 	session := session.NewServerSession(conn, func(stream *session.Stream) {
 		defer stream.Close()
 
+		// a stream that never sends its destination must not hold its
+		// goroutine forever
+		setHandshakeDeadline(stream)
 		destination, err := M.SocksaddrSerializer.ReadAddrPort(stream)
 		if err != nil {
 			return
 		}
+		clearHandshakeDeadline(stream)
 
 		// It seems that mihomo does not implement a connection error reporting mechanism, so we report success directly.
 		err = stream.HandshakeSuccess()

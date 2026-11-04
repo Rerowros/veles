@@ -14,7 +14,22 @@ type RealityOptions struct {
 	PublicKey string `proxy:"public-key"`
 	ShortID   string `proxy:"short-id,omitempty"`
 
+	// P6: true always offers X25519MLKEM768. Without it the first
+	// handshake to a server is classic (Xray 26.3.27 can fail with
+	// ML-KEM) and the core learns per server whether it
+	// needs ML-KEM (Xray >= 26.9.8) from the handshake outcome (P6).
 	SupportX25519MLKEM768 bool `proxy:"support-x25519mlkem768,omitempty"`
+
+	// MLKEMClientFingerprint (P7) replaces client-fingerprint for a
+	// handshake that offers X25519MLKEM768. Some networks treat
+	// ClientHello fingerprints differently, so a fingerprint can be chosen
+	// for the ML-KEM handshake alone: firefox is one that
+	// also carries the ML-KEM key share.
+	MLKEMClientFingerprint string `proxy:"mlkem-client-fingerprint,omitempty"`
+
+	// ClientVersion overrides the "x.y.z" version reported to the server
+	// (default tlsC.DefaultRealityClientVersion).
+	ClientVersion string `proxy:"client-version,omitempty"`
 }
 
 func (o RealityOptions) Parse() (*tlsC.RealityConfig, error) {
@@ -39,6 +54,24 @@ func (o RealityOptions) Parse() (*tlsC.RealityConfig, error) {
 		n, err = hex.Decode(config.ShortID[:], []byte(o.ShortID))
 		if err != nil || n > tlsC.RealityMaxShortIDLen {
 			return nil, errors.New("invalid REALITY short ID")
+		}
+
+		if o.MLKEMClientFingerprint != "" {
+			fingerprint, ok := tlsC.GetFingerprint(o.MLKEMClientFingerprint)
+			if !ok {
+				return nil, fmt.Errorf("invalid mlkem-client-fingerprint %q", o.MLKEMClientFingerprint)
+			}
+			if !tlsC.FingerprintSupportsX25519MLKEM768(fingerprint) {
+				return nil, fmt.Errorf("mlkem-client-fingerprint %q has no X25519MLKEM768 key share", o.MLKEMClientFingerprint)
+			}
+			config.MLKEMFingerprint = &fingerprint
+		}
+
+		if o.ClientVersion != "" {
+			config.ClientVersion, err = tlsC.ParseRealityClientVersion(o.ClientVersion)
+			if err != nil {
+				return nil, err
+			}
 		}
 
 		return config, nil

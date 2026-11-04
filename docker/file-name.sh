@@ -1,5 +1,5 @@
 #!/bin/sh
-os="mihomo-linux-"
+os="veles-linux-"
 case $TARGETPLATFORM in
     "linux/amd64")
         arch="amd64-v1"

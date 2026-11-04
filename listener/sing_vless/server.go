@@ -12,19 +12,22 @@ import (
 	"github.com/metacubex/mihomo/component/ech"
 	C "github.com/metacubex/mihomo/constant"
 	LC "github.com/metacubex/mihomo/listener/config"
+	"github.com/metacubex/mihomo/listener/fallback"
 	"github.com/metacubex/mihomo/listener/jls"
+	"github.com/metacubex/mihomo/listener/preauth"
 	"github.com/metacubex/mihomo/listener/reality"
 	"github.com/metacubex/mihomo/listener/restls"
 	"github.com/metacubex/mihomo/listener/shadowtls"
 	"github.com/metacubex/mihomo/listener/sing"
+	"github.com/metacubex/mihomo/log"
 	"github.com/metacubex/mihomo/ntp"
 	"github.com/metacubex/mihomo/transport/gun"
 	"github.com/metacubex/mihomo/transport/vless/encryption"
 	mihomoVMess "github.com/metacubex/mihomo/transport/vmess"
+	"github.com/metacubex/mihomo/transport/xdrive"
 	"github.com/metacubex/mihomo/transport/xhttp"
 
 	"github.com/metacubex/http"
-	"github.com/metacubex/sing/common"
 	"github.com/metacubex/sing/common/metadata"
 	"github.com/metacubex/tls"
 	"golang.org/x/exp/slices"
@@ -34,8 +37,10 @@ type Listener struct {
 	closed     bool
 	config     LC.VlessServer
 	listeners  []net.Listener
-	service    *Service[string]
+	xdrive     *xdrive.Listener
+	service    *Service
 	decryption *encryption.ServerInstance
+	handler    *sing.ListenerHandler
 }
 
 func New(config LC.VlessServer, lc C.InboundListenConfig, tunnel C.Tunnel, additions ...inbound.Addition) (sl *Listener, err error) {
@@ -55,19 +60,10 @@ func New(config LC.VlessServer, lc C.InboundListenConfig, tunnel C.Tunnel, addit
 		return nil, err
 	}
 
-	service := NewService[string](h)
-	service.UpdateUsers(
-		common.Map(config.Users, func(it LC.VlessUser) string {
-			return it.Username
-		}),
-		common.Map(config.Users, func(it LC.VlessUser) string {
-			return it.UUID
-		}),
-		common.Map(config.Users, func(it LC.VlessUser) string {
-			return it.Flow
-		}))
+	service := NewService(h)
+	service.UpdateUsers(config.Users)
 
-	sl = &Listener{config: config, service: service}
+	sl = &Listener{config: config, service: service, handler: h}
 
 	sl.decryption, err = encryption.NewServer(config.Decryption)
 	if err != nil {
@@ -84,9 +80,13 @@ func New(config LC.VlessServer, lc C.InboundListenConfig, tunnel C.Tunnel, addit
 
 	httpServer := http.Server{
 		IdleTimeout: 30 * time.Second,
-		Protocols:   new(http.Protocols),
+		// bounds the TLS handshake and each HTTP/1 request header; the time
+		// to the first request (h2c preface, h2 conn with no stream) is
+		// bounded by preauth.GuardFirstRequest below
+		ReadHeaderTimeout: handshakeTimeout,
+		Protocols:         new(http.Protocols),
 	}
-	tlsConfig := &tls.Config{Time: ntp.Now}
+	tlsConfig := &tls.Config{Time: ntp.Now, MinVersion: tls.VersionTLS12}
 	var shadowTLSBuilder *shadowtls.Builder
 	var restlsBuilder *restls.Builder
 	var jlsBuilder *jls.Builder
@@ -164,9 +164,19 @@ func New(config LC.VlessServer, lc C.InboundListenConfig, tunnel C.Tunnel, addit
 			return nil, err
 		}
 	}
+	xhttpOn := config.XHTTPConfig.Path != "" || config.XHTTPConfig.Host != "" || config.XHTTPConfig.Mode != ""
+	// fallback-page: what a request that is not the inbound's own gets on an HTTP transport.
+	// Only with one: a handler makes the listener serve HTTP, which plain VLESS does not.
+	var page http.Handler
+	if config.FallbackPage != "" && (config.WsPath != "" || config.GrpcServiceName != "" || xhttpOn) {
+		if page, err = fallback.Page(config.FallbackPage); err != nil {
+			return nil, err
+		}
+	} else if config.FallbackPage != "" {
+		log.Warnln("VLESS inbound %s: fallback-page is ignored without ws-path, grpc-service-name or xhttp-config", config.Listen)
+	}
 	if config.WsPath != "" {
-		httpMux := http.NewServeMux()
-		httpMux.HandleFunc(config.WsPath, func(w http.ResponseWriter, r *http.Request) {
+		httpServer.Handler = fallback.WebSocket(config.WsPath, page, func(w http.ResponseWriter, r *http.Request) {
 			conn, err := mihomoVMess.StreamUpgradedWebsocketConn(w, r)
 			if err != nil {
 				http.Error(w, err.Error(), 500)
@@ -174,17 +184,20 @@ func New(config LC.VlessServer, lc C.InboundListenConfig, tunnel C.Tunnel, addit
 			}
 			sl.HandleConn(conn, tunnel, additions...)
 		})
-		httpServer.Handler = httpMux
 		httpServer.Protocols.SetHTTP1(true)
 		tlsConfig.NextProtos = append(tlsConfig.NextProtos, "http/1.1")
 	}
 	if config.GrpcServiceName != "" {
+		other := httpServer.Handler
+		if other == nil {
+			other = page
+		}
 		httpServer.Handler = gun.NewServerHandler(gun.ServerOption{
 			ServiceName: config.GrpcServiceName,
 			ConnHandler: func(conn net.Conn) {
 				sl.HandleConn(conn, tunnel, additions...)
 			},
-			HttpHandler: httpServer.Handler,
+			HttpHandler: other,
 		})
 		httpServer.Protocols.SetHTTP2(true)
 		// SetUnencryptedHTTP2 to ensure we can work in plain http2 and some tls conn is not *tls.Conn (like *reality.Conn)
@@ -204,7 +217,7 @@ func New(config LC.VlessServer, lc C.InboundListenConfig, tunnel C.Tunnel, addit
 			return nil, errors.New("unsupported xhttp mode")
 		}
 	}
-	if config.XHTTPConfig.Path != "" || config.XHTTPConfig.Host != "" || config.XHTTPConfig.Mode != "" {
+	if xhttpOn {
 		httpServer.Handler, err = xhttp.NewServerHandler(xhttp.ServerOption{
 			Config: xhttp.Config{
 				Host:                 config.XHTTPConfig.Host,
@@ -233,6 +246,7 @@ func New(config LC.VlessServer, lc C.InboundListenConfig, tunnel C.Tunnel, addit
 				sl.HandleConn(conn, tunnel, additions...)
 			},
 			HttpHandler: httpServer.Handler,
+			Fallback:    page,
 		})
 		if err != nil {
 			return nil, err
@@ -254,6 +268,51 @@ func New(config LC.VlessServer, lc C.InboundListenConfig, tunnel C.Tunnel, addit
 			tlsConfig.NextProtos = append([]string{"h2"}, tlsConfig.NextProtos...)
 		}
 	}
+	if httpServer.Handler != nil {
+		preauth.GuardFirstRequest(&httpServer, handshakeTimeout)
+	}
+	if config.XDriveConfig.Service != "" {
+		// xdrive is a transport without a listening socket: both peers exchange
+		// segments through a cloud folder, and the storage provides transport
+		// security (HTTPS). A TLS layer or a second transport on top would not
+		// be carried by the protocol, so reject the combination instead of
+		// silently ignoring it.
+		if config.WsPath != "" || config.GrpcServiceName != "" || config.XHTTPConfig.Path != "" ||
+			config.XHTTPConfig.Host != "" || config.XHTTPConfig.Mode != "" {
+			return nil, errors.New("xdrive transport cannot be combined with ws, grpc or xhttp")
+		}
+		if len(securityModes) > 0 {
+			return nil, errors.New("xdrive transport gets transport security from the storage service; remove certificate/shadow-tls/res-tls/jls/reality: " + strings.Join(securityModes, ", "))
+		}
+		if sl.decryption == nil && !config.AllowInsecure {
+			return nil, errors.New("xdrive carries VLESS over the cloud folder without TLS; set decryption or allow-insecure")
+		}
+		sl.xdrive, err = xdrive.Listen(&xdrive.Config{
+			Service:         config.XDriveConfig.Service,
+			RemoteFolder:    config.XDriveConfig.RemoteFolder,
+			Secrets:         config.XDriveConfig.Secrets,
+			Template:        config.XDriveConfig.Template,
+			SegmentBytes:    config.XDriveConfig.SegmentBytes,
+			FlushInterval:   time.Duration(config.XDriveConfig.FlushIntervalMs) * time.Millisecond,
+			PollInterval:    time.Duration(config.XDriveConfig.PollIntervalMs) * time.Millisecond,
+			MaxPollInterval: time.Duration(config.XDriveConfig.MaxPollIntervalMs) * time.Millisecond,
+			EagerWindow:     time.Duration(config.XDriveConfig.EagerWindowMs) * time.Millisecond,
+			HoleTimeout:     time.Duration(config.XDriveConfig.HoleTimeoutMs) * time.Millisecond,
+			SessionTTL:      time.Duration(config.XDriveConfig.SessionTTLSeconds) * time.Second,
+			Concurrency:     config.XDriveConfig.Concurrency,
+		}, func(conn net.Conn) {
+			// Only peers with the storage secrets reach this, and one round
+			// trip through the cloud folder can take seconds: the 15 s
+			// pre-auth deadline of a socket would cut the VLESS Encryption
+			// handshake. SessionTTL bounds an idle session instead.
+			sl.handleConn(conn, false, tunnel, additions...)
+		})
+		if err != nil {
+			return nil, err
+		}
+		return sl, nil
+	}
+
 	for _, addr := range strings.Split(config.Listen, ",") {
 		addr := addr
 
@@ -299,9 +358,26 @@ func New(config LC.VlessServer, lc C.InboundListenConfig, tunnel C.Tunnel, addit
 	return sl, nil
 }
 
+// UpdateUsers replaces the user table of the running listener: a new UUID is
+// accepted on the next handshake; a removed or re-keyed user is revoked and its
+// open connections are closed.
+func (l *Listener) UpdateUsers(users []LC.VlessUser) C.InboundUserChange {
+	return l.service.UpdateUsers(users)
+}
+
+// Users returns the current user table of the running listener.
+func (l *Listener) Users() []LC.VlessUser {
+	return l.service.Users()
+}
+
 func (l *Listener) Close() error {
 	l.closed = true
 	var retErr error
+	if l.xdrive != nil {
+		if err := l.xdrive.Close(); err != nil {
+			retErr = err
+		}
+	}
 	for _, lis := range l.listeners {
 		err := lis.Close()
 		if err != nil {
@@ -310,6 +386,9 @@ func (l *Listener) Close() error {
 	}
 	if l.decryption != nil {
 		_ = l.decryption.Close()
+	}
+	if err := l.handler.Close(); err != nil {
+		retErr = err
 	}
 	return retErr
 }
@@ -326,7 +405,16 @@ func (l *Listener) AddrList() (addrList []net.Addr) {
 }
 
 func (l *Listener) HandleConn(conn net.Conn, tunnel C.Tunnel, additions ...inbound.Addition) {
+	l.handleConn(conn, true, tunnel, additions...)
+}
+
+func (l *Listener) handleConn(conn net.Conn, deadline bool, tunnel C.Tunnel, additions ...inbound.Addition) {
 	ctx := sing.WithAdditions(context.TODO(), additions...)
+	// cleared by NewConnection once the request header is read and the user
+	// is authenticated
+	if deadline {
+		setHandshakeDeadline(conn)
+	}
 	if l.decryption != nil {
 		c, err := l.decryption.Handshake(conn, nil)
 		if err != nil {

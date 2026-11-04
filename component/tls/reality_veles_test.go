@@ -1,0 +1,205 @@
+package tls
+
+import (
+	"context"
+	"crypto/ecdh"
+	"crypto/rand"
+	"net"
+	"slices"
+	"testing"
+	"time"
+
+	utls "github.com/metacubex/utls"
+)
+
+// Veles patch set: REALITY must report the Xray-style client
+// version 26.10.21 (P1/P3). X25519MLKEM768 is stripped from the ClientHello
+// unless reality-opts.support-x25519mlkem768 is true (upstream semantics);
+// with it, the fingerprint's ML-KEM key share stays before X25519, as Xray
+// >= 26.9.8 (XTLS/REALITY 8cdf7bf) requires.
+
+func TestVelesFingerprintVersions(t *testing.T) {
+	// Guards against Go MVS silently resolving metacubex/utls back to v1.8.7
+	// (Firefox 120 / Safari 16) in a consumer module.
+	for name, want := range map[string]string{
+		"chrome":  "133",
+		"firefox": "148",
+		"safari":  "26.3",
+		"edge":    "85",
+	} {
+		id, ok := GetFingerprint(name)
+		if !ok {
+			t.Fatalf("fingerprint %q not found", name)
+		}
+		if id.Version != want {
+			t.Errorf("fingerprint %q = %s %s, want version %s", name, id.Client, id.Version, want)
+		}
+	}
+}
+
+func TestVelesRealityDefaultClientVersion(t *testing.T) {
+	for _, name := range []string{"chrome", "firefox", "safari", "edge"} {
+		t.Run(name, func(t *testing.T) {
+			id, _ := GetFingerprint(name)
+			hello, privateKey := captureRealityClientHello(t, id)
+			plain := decryptRealitySessionID(t, hello, privateKey)
+			if got, want := [3]byte(plain[:3]), [3]byte{26, 10, 21}; got != want {
+				t.Fatalf("REALITY client version = %v, want %v", got, want)
+			}
+			if plain[3] != 0 {
+				t.Fatalf("REALITY reserved byte = %d, want 0", plain[3])
+			}
+		})
+	}
+}
+
+func TestVelesRealityClientVersionOverride(t *testing.T) {
+	id, _ := GetFingerprint("firefox")
+	hello, privateKey := captureRealityClientHelloWithConfig(t, id, RealityConfig{ClientVersion: RealityClientVersion{1, 8, 2}})
+	plain := decryptRealitySessionID(t, hello, privateKey)
+	if got, want := [3]byte(plain[:3]), [3]byte{1, 8, 2}; got != want {
+		t.Fatalf("REALITY client version = %v, want %v", got, want)
+	}
+}
+
+// The configured mlkem-client-fingerprint must reach the wire: the captured
+// ClientHello has the shape of Firefox, not of the configured chrome, exactly
+// when the handshake offers X25519MLKEM768.
+func TestVelesRealityMLKEMFingerprintReachesClientHello(t *testing.T) {
+	firefox, _ := GetFingerprint("firefox")
+	hello, _ := captureRealityClientHelloWithConfig(t, utls.HelloChrome_Auto, RealityConfig{
+		SupportX25519MLKEM768: true,
+		MLKEMFingerprint:      &firefox,
+	})
+	assertClientHelloShape(t, buildClientHello(t, utls.HelloFirefox_Auto), hello)
+	if !slices.Contains(keyShareGroups(hello), utls.X25519MLKEM768) {
+		t.Fatalf("Firefox ClientHello has no X25519MLKEM768: %v", keyShareGroups(hello))
+	}
+}
+
+func TestVelesRealityMLKEMFingerprintSelection(t *testing.T) {
+	chrome, _ := GetFingerprint("chrome")
+	firefox, _ := GetFingerprint("firefox")
+
+	config := &RealityConfig{MLKEMFingerprint: &firefox}
+	if got := realityFingerprint(true, chrome, config); got.Client != firefox.Client || got.Version != firefox.Version {
+		t.Fatalf("ML-KEM handshake used %s %s, want firefox", got.Client, got.Version)
+	}
+	if got := realityFingerprint(false, chrome, config); got.Client != chrome.Client || got.Version != chrome.Version {
+		t.Fatalf("classic handshake used %s %s, want the configured chrome", got.Client, got.Version)
+	}
+
+	config = &RealityConfig{}
+	if got := realityFingerprint(true, chrome, config); got.Client != chrome.Client || got.Version != chrome.Version {
+		t.Fatalf("without mlkem-client-fingerprint ML-KEM handshake used %s %s, want chrome", got.Client, got.Version)
+	}
+}
+
+func TestVelesParseRealityClientVersion(t *testing.T) {
+	v, err := ParseRealityClientVersion("26.9.9")
+	if err != nil || v != (RealityClientVersion{26, 9, 9}) {
+		t.Fatalf("ParseRealityClientVersion(26.9.9) = %v, %v", v, err)
+	}
+	for _, bad := range []string{"", "26.3", "26.3.27.1", "26.3.x", "256.0.0", "-1.0.0"} {
+		if _, err := ParseRealityClientVersion(bad); err == nil {
+			t.Errorf("ParseRealityClientVersion(%q) succeeded, want error", bad)
+		}
+	}
+}
+
+// xrayAcceptsKeyShares mirrors the key share walk of XTLS/REALITY 8cdf7bf
+// (Xray >= 26.9.8): X25519MLKEM768 must be present and come before X25519.
+func xrayAcceptsKeyShares(keyShares []utls.KeyShare) bool {
+	var hasMLKEM bool
+	for _, keyShare := range keyShares {
+		if keyShare.Group == utls.X25519MLKEM768 {
+			if hasMLKEM {
+				return false
+			}
+			hasMLKEM = true
+			continue
+		}
+		if keyShare.Group == utls.X25519 {
+			break
+		}
+	}
+	return hasMLKEM
+}
+
+func TestVelesRealityMLKEMKeyShare(t *testing.T) {
+	for name, withMLKEM := range map[string]bool{
+		"chrome":  true,
+		"firefox": true,
+		"safari":  true,
+		// Edge 85 has no ML-KEM at all: Xray >= 26.9.8 rejects it for any client.
+		"edge":       false,
+		"chrome120":  false,
+		"firefox120": false,
+	} {
+		t.Run(name, func(t *testing.T) {
+			id, _ := GetFingerprint(name)
+
+			// Default: ML-KEM stripped from supported groups and key shares,
+			// X25519 key share kept.
+			hello, _ := captureRealityClientHello(t, id)
+			t.Logf("%s %s default: ClientHello %d bytes, key shares %v", id.Client, id.Version, len(hello.Raw), keyShareGroups(hello))
+			if slices.Contains(hello.SupportedCurves, utls.X25519MLKEM768) || slices.Contains(keyShareGroups(hello), utls.X25519MLKEM768) {
+				t.Fatalf("default ClientHello contains X25519MLKEM768: curves %v, key shares %v", hello.SupportedCurves, keyShareGroups(hello))
+			}
+			if !slices.Contains(keyShareGroups(hello), utls.X25519) {
+				t.Fatalf("default ClientHello has no X25519 key share: %v", keyShareGroups(hello))
+			}
+
+			// support-x25519mlkem768: true keeps the fingerprint's ML-KEM key
+			// share before X25519.
+			hello, _ = captureRealityClientHelloWithConfig(t, id, RealityConfig{SupportX25519MLKEM768: true})
+			t.Logf("%s %s support-x25519mlkem768: ClientHello %d bytes, key shares %v", id.Client, id.Version, len(hello.Raw), keyShareGroups(hello))
+			if got := xrayAcceptsKeyShares(hello.KeyShares); got != withMLKEM {
+				t.Fatalf("ML-KEM before X25519 = %v, want %v (key shares %v)", got, withMLKEM, keyShareGroups(hello))
+			}
+		})
+	}
+}
+
+func keyShareGroups(hello *utls.PubClientHelloMsg) []utls.CurveID {
+	groups := make([]utls.CurveID, 0, len(hello.KeyShares))
+	for _, ks := range hello.KeyShares {
+		groups = append(groups, ks.Group)
+	}
+	return groups
+}
+
+func captureRealityClientHelloWithConfig(t *testing.T, fingerprint utls.ClientHelloID, config RealityConfig) (*utls.PubClientHelloMsg, *ecdh.PrivateKey) {
+	t.Helper()
+	privateKey, err := ecdh.X25519().GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, server := net.Pipe()
+	t.Cleanup(func() {
+		client.Close()
+		server.Close()
+	})
+	deadline := time.Now().Add(5 * time.Second)
+	_ = client.SetDeadline(deadline)
+	_ = server.SetDeadline(deadline)
+
+	result := make(chan error, 1)
+	go func() {
+		config.PublicKey = privateKey.PublicKey()
+		_, err := GetRealityConn(context.Background(), client, fingerprint, "example.com", &config)
+		result <- err
+	}()
+
+	hello, err := readClientHello(server)
+	if err != nil || hello == nil {
+		t.Fatalf("capture ClientHello: %v", err)
+	}
+	_ = server.Close()
+	select {
+	case <-result:
+	case <-time.After(time.Second):
+		t.Fatal("REALITY client did not stop after capture connection closed")
+	}
+	return hello, privateKey
+}

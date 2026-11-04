@@ -21,6 +21,10 @@ type ServerOption struct {
 	Config
 	ConnHandler func(net.Conn)
 	HttpHandler http.Handler
+	// Fallback answers a request that is not the inbound's own in place of a 404: another
+	// host, a path outside the inbound's with no HttpHandler, or no XHTTP request at all
+	// (the listener's fallback-page). nil: the 404 as before.
+	Fallback http.Handler
 }
 
 type httpServerConn struct {
@@ -76,10 +80,24 @@ func (c *httpServerConn) Wait() <-chan struct{} {
 	return c.done
 }
 
+// maxPendingSessions bounds the sessions that never started a download; it is
+// a var so tests can lower it.
+var maxPendingSessions = 4096
+
+const (
+	// pendingSessionTimeout reaps an orphan session of a probe or a broken
+	// client. A real session starts its download within this time.
+	pendingSessionTimeout = 30 * time.Second
+	// pendingUploadTimeout bounds reading the body of an upload that arrives
+	// before the session's download, so a slow-loris cannot hold a handler.
+	pendingUploadTimeout = 15 * time.Second
+)
+
 type httpSession struct {
 	uploadQueue *UploadQueue
 	connected   chan struct{}
 	once        sync.Once
+	pending     bool
 }
 
 func newHTTPSession(maxPackets int) *httpSession {
@@ -99,14 +117,16 @@ type requestHandler struct {
 	config      Config
 	connHandler func(net.Conn)
 	httpHandler http.Handler
+	fallback    http.Handler // ServerOption.Fallback
 
 	xPaddingBytes        Range
 	scMaxEachPostBytes   Range
 	scStreamUpServerSecs Range
 	scMaxBufferedPosts   Range
 
-	mu       sync.Mutex
+	mu       sync.RWMutex
 	sessions map[string]*httpSession
+	pending  int
 }
 
 func NewServerHandler(opt ServerOption) (http.Handler, error) {
@@ -130,6 +150,7 @@ func NewServerHandler(opt ServerOption) (http.Handler, error) {
 		config:               opt.Config,
 		connHandler:          opt.ConnHandler,
 		httpHandler:          opt.HttpHandler,
+		fallback:             opt.Fallback,
 		xPaddingBytes:        xPaddingBytes,
 		scMaxEachPostBytes:   scMaxEachPostBytes,
 		scStreamUpServerSecs: scStreamUpServerSecs,
@@ -139,25 +160,39 @@ func NewServerHandler(opt ServerOption) (http.Handler, error) {
 }
 
 func (h *requestHandler) upsertSession(sessionID string) *httpSession {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-
-	s, ok := h.sessions[sessionID]
-	if ok {
+	// The session exists for every request of a session: take the shared lock
+	// first, so the hot path does not serialize all sessions of the handler.
+	h.mu.RLock()
+	s := h.sessions[sessionID]
+	h.mu.RUnlock()
+	if s != nil {
 		return s
 	}
 
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	if s = h.sessions[sessionID]; s != nil {
+		return s
+	}
+	if h.pending >= maxPendingSessions {
+		return nil
+	}
+
 	s = newHTTPSession(h.scMaxBufferedPosts.Max)
+	s.pending = true
+	h.pending++
 	h.sessions[sessionID] = s
 
 	// Reap orphan sessions that never become fully connected (e.g. from probing).
-	// Matches Xray-core's 30-second reaper in upsertSession.
+	// Matches Xray-core's reaper in upsertSession.
+	timeout := pendingSessionTimeout // read here, not in the goroutine, which may outlive a test that changes it
 	go func() {
-		timer := time.NewTimer(30 * time.Second)
+		timer := time.NewTimer(timeout)
 		defer timer.Stop()
 		select {
 		case <-timer.C:
-			h.deleteSession(sessionID)
+			h.deleteSession(sessionID, s)
 		case <-s.connected:
 		}
 	}()
@@ -165,19 +200,47 @@ func (h *requestHandler) upsertSession(sessionID string) *httpSession {
 	return s
 }
 
-func (h *requestHandler) deleteSession(sessionID string) {
+// deleteSession removes s only when it is still the session registered under
+// sessionID: a reaper that fires after the ID was reused must not close the
+// newer session.
+func (h *requestHandler) deleteSession(sessionID string, s *httpSession) {
 	h.mu.Lock()
-	defer h.mu.Unlock()
-
-	if s, ok := h.sessions[sessionID]; ok {
-		_ = s.uploadQueue.Close()
-		delete(h.sessions, sessionID)
+	if h.sessions[sessionID] != s {
+		h.mu.Unlock()
+		return
 	}
+	delete(h.sessions, sessionID)
+	if s.pending {
+		s.pending = false
+		h.pending--
+	}
+	h.mu.Unlock()
+
+	// Close outside the lock: Close waits for the queue's readers.
+	_ = s.uploadQueue.Close()
+}
+
+// markConnected moves a session out of the pending budget when its download
+// starts.
+func (h *requestHandler) markConnected(s *httpSession) {
+	s.markConnected()
+	h.mu.Lock()
+	if s.pending {
+		s.pending = false
+		h.pending--
+	}
+	h.mu.Unlock()
+}
+
+func (h *requestHandler) sessionPending(s *httpSession) bool {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return s.pending
 }
 
 func (h *requestHandler) getSession(sessionID string) *httpSession {
-	h.mu.Lock()
-	defer h.mu.Unlock()
+	h.mu.RLock()
+	defer h.mu.RUnlock()
 	return h.sessions[sessionID]
 }
 
@@ -232,12 +295,12 @@ func (h *requestHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if h.config.Host != "" && !equalHost(r.Host, h.config.Host) {
-		http.NotFound(w, r)
+		h.notFound(w, r)
 		return
 	}
 
 	if !strings.HasPrefix(r.URL.Path, path) {
-		http.NotFound(w, r)
+		h.notFound(w, r)
 		return
 	}
 
@@ -261,13 +324,23 @@ func (h *requestHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	h.config.ApplyXPaddingToResponse(w, config)
 
+	paddingValue, _ := h.config.ExtractXPaddingFromRequest(r, h.config.XPaddingObfsMode)
+	paddingValid := h.config.IsPaddingValid(paddingValue, h.xPaddingBytes.Min, h.xPaddingBytes.Max, PaddingMethod(h.config.XPaddingMethod))
+	// No XHTTP client sends a request without its padding: a stranger gets the fallback, an
+	// OPTIONS too, before its 200 with the CORS and padding headers that would tell XHTTP
+	// apart. Only a browser's own CORS preflight goes without padding, and the browser dialer
+	// is no client of an inbound with a fallback-page.
+	if !paddingValid && h.fallback != nil {
+		h.notFound(w, r)
+		return
+	}
+
 	if r.Method == "OPTIONS" {
 		w.WriteHeader(http.StatusOK)
 		return
 	}
 
-	paddingValue, _ := h.config.ExtractXPaddingFromRequest(r, h.config.XPaddingObfsMode)
-	if !h.config.IsPaddingValid(paddingValue, h.xPaddingBytes.Min, h.xPaddingBytes.Max, PaddingMethod(h.config.XPaddingMethod)) {
+	if !paddingValid {
 		http.Error(w, "invalid xpadding", http.StatusBadRequest)
 		return
 	}
@@ -277,6 +350,10 @@ func (h *requestHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var currentSession *httpSession
 	if sessionId != "" {
 		currentSession = h.upsertSession(sessionId)
+		if currentSession == nil {
+			http.Error(w, "too many pending sessions", http.StatusServiceUnavailable)
+			return
+		}
 	}
 
 	// stream-up upload: POST /path/{session}
@@ -328,8 +405,15 @@ func (h *requestHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// packet-up upload: POST /path/{session}/{seq}
-	if r.Method != http.MethodGet && sessionId != "" && seqStr != "" && h.allowPacketUpUpload() {
+	// packet-up upload: POST, or GET with the payload in headers/cookies, to
+	// /path/{session}/{seq}. A GET without a seq is the download request below,
+	// so the method alone does not distinguish the two.
+	if sessionId != "" && seqStr != "" && h.allowPacketUpUpload() {
+		if h.sessionPending(currentSession) {
+			// An upload that arrives before the session's download is still
+			// pre-auth traffic: bound the time it may hold the handler.
+			_ = http.NewResponseController(w).SetReadDeadline(time.Now().Add(pendingUploadTimeout))
+		}
 		scMaxEachPostBytes := h.scMaxEachPostBytes.Max
 		dataPlacement := h.config.GetNormalizedUplinkDataPlacement()
 		uplinkDataKey := h.config.UplinkDataKey
@@ -428,7 +512,7 @@ func (h *requestHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// stream-up/packet-up download: GET /path/{session}
 	if r.Method == http.MethodGet && sessionId != "" && seqStr == "" && h.allowSessionDownload() {
-		currentSession.markConnected()
+		h.markConnected(currentSession)
 
 		// magic header instructs nginx + apache to not buffer response body
 		w.Header().Set("X-Accel-Buffering", "no")
@@ -451,7 +535,7 @@ func (h *requestHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			writer: httpSC,
 			reader: currentSession.uploadQueue,
 			onClose: func() {
-				h.deleteSession(sessionId)
+				h.deleteSession(sessionId, currentSession)
 			},
 		}
 		httputils.SetAddrFromRequest(&conn.NetAddr, r)
@@ -495,7 +579,20 @@ func (h *requestHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	http.NotFound(w, r)
+	h.notFound(w, r)
+}
+
+// notFound answers a request that is not this inbound's: the fallback, without the headers
+// set so far for an XHTTP response, when there is one; a 404 as before otherwise.
+func (h *requestHandler) notFound(w http.ResponseWriter, r *http.Request) {
+	if h.fallback == nil {
+		http.NotFound(w, r)
+		return
+	}
+	for k := range w.Header() {
+		delete(w.Header(), k)
+	}
+	h.fallback.ServeHTTP(w, r)
 }
 
 func splitNonEmpty(s string) []string {

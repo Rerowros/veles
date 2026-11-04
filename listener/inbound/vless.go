@@ -1,12 +1,15 @@
 package inbound
 
 import (
+	"fmt"
 	"strings"
 
+	"github.com/metacubex/mihomo/common/utils"
 	C "github.com/metacubex/mihomo/constant"
 	LC "github.com/metacubex/mihomo/listener/config"
 	"github.com/metacubex/mihomo/listener/sing_vless"
 	"github.com/metacubex/mihomo/log"
+	"github.com/metacubex/mihomo/transport/vless"
 )
 
 type VlessOption struct {
@@ -15,7 +18,9 @@ type VlessOption struct {
 	Decryption      string        `inbound:"decryption,omitempty"`
 	WsPath          string        `inbound:"ws-path,omitempty"`
 	XHTTPConfig     XHTTPConfig   `inbound:"xhttp-config,omitempty"`
+	XDriveConfig    XDriveConfig  `inbound:"xdrive-config,omitempty"`
 	GrpcServiceName string        `inbound:"grpc-service-name,omitempty"`
+	FallbackPage    string        `inbound:"fallback-page,omitempty"`
 	Certificate     string        `inbound:"certificate,omitempty"`
 	PrivateKey      string        `inbound:"private-key,omitempty"`
 	ClientAuthType  string        `inbound:"client-auth-type,omitempty"`
@@ -59,6 +64,40 @@ type XHTTPConfig struct {
 	ScMaxEachPostBytes   string `inbound:"sc-max-each-post-bytes,omitempty"`
 }
 
+// XDriveConfig is the inbound form of XDriveOptions. The inbound has no
+// listening port: it polls the session directory of the storage.
+type XDriveConfig struct {
+	Service           string   `inbound:"service"`
+	RemoteFolder      string   `inbound:"remote-folder"`
+	Secrets           []string `inbound:"secrets,omitempty"`
+	Template          string   `inbound:"template,omitempty"`
+	SegmentBytes      int      `inbound:"segment-bytes,omitempty"`
+	FlushIntervalMs   int      `inbound:"flush-interval-ms,omitempty"`
+	PollIntervalMs    int      `inbound:"poll-interval-ms,omitempty"`
+	MaxPollIntervalMs int      `inbound:"max-poll-interval-ms,omitempty"`
+	EagerWindowMs     int      `inbound:"eager-window-ms,omitempty"`
+	HoleTimeoutMs     int      `inbound:"hole-timeout-ms,omitempty"`
+	SessionTTLSeconds int      `inbound:"session-ttl-seconds,omitempty"`
+	Concurrency       int      `inbound:"concurrency,omitempty"`
+}
+
+func (o XDriveConfig) Build() LC.XDriveConfig {
+	return LC.XDriveConfig{
+		Service:           o.Service,
+		RemoteFolder:      o.RemoteFolder,
+		Secrets:           o.Secrets,
+		Template:          o.Template,
+		SegmentBytes:      o.SegmentBytes,
+		FlushIntervalMs:   o.FlushIntervalMs,
+		PollIntervalMs:    o.PollIntervalMs,
+		MaxPollIntervalMs: o.MaxPollIntervalMs,
+		EagerWindowMs:     o.EagerWindowMs,
+		HoleTimeoutMs:     o.HoleTimeoutMs,
+		SessionTTLSeconds: o.SessionTTLSeconds,
+		Concurrency:       o.Concurrency,
+	}
+}
+
 func (o XHTTPConfig) Build() LC.XHTTPConfig {
 	return LC.XHTTPConfig{
 		Path:                 o.Path,
@@ -93,21 +132,31 @@ type Vless struct {
 	*Base
 	config *VlessOption
 	l      C.MultiAddrListener
+	svc    *sing_vless.Listener
 	vs     LC.VlessServer
 }
 
 func NewVless(options *VlessOption) (*Vless, error) {
-	base, err := NewBase(&options.BaseOption)
+	base, err := newStreamBase(&options.BaseOption)
 	if err != nil {
 		return nil, err
 	}
-	users := make([]LC.VlessUser, len(options.Users))
-	for i, v := range options.Users {
-		users[i] = LC.VlessUser{
+	users := make([]LC.VlessUser, 0, len(options.Users))
+	seen := newVlessUserSet(len(options.Users))
+	for _, v := range options.Users {
+		user := LC.VlessUser{
 			Username: v.Username,
 			UUID:     v.UUID,
 			Flow:     v.Flow,
 		}
+		// A duplicate in the config must not stop mihomo from starting: the
+		// first user is kept, the duplicate is dropped with a warning. The
+		// API paths (SetUsers) still reject duplicates.
+		if err := seen.add(user); err != nil {
+			log.Warnln("Vless[%s]: user %q dropped: %v", base.Name(), v.Username, err)
+			continue
+		}
+		users = append(users, user)
 	}
 	return &Vless{
 		Base:   base,
@@ -119,7 +168,9 @@ func NewVless(options *VlessOption) (*Vless, error) {
 			Decryption:      options.Decryption,
 			WsPath:          options.WsPath,
 			XHTTPConfig:     options.XHTTPConfig.Build(),
+			XDriveConfig:    options.XDriveConfig.Build(),
 			GrpcServiceName: options.GrpcServiceName,
+			FallbackPage:    options.FallbackPage,
 			Certificate:     options.Certificate,
 			PrivateKey:      options.PrivateKey,
 			ClientAuthType:  options.ClientAuthType,
@@ -142,6 +193,9 @@ func (v *Vless) Config() C.InboundConfig {
 
 // Address implements constant.InboundListener
 func (v *Vless) Address() string {
+	if v.config.XDriveConfig.Service != "" {
+		return "xdrive:" + v.config.XDriveConfig.Service
+	}
 	var addrList []string
 	if v.l != nil {
 		for _, addr := range v.l.AddrList() {
@@ -154,11 +208,101 @@ func (v *Vless) Address() string {
 // Listen implements constant.InboundListener
 func (v *Vless) Listen(tunnel C.Tunnel) error {
 	var err error
-	v.l, err = sing_vless.New(v.vs, v.ListenConfig(), tunnel, v.Additions()...)
+	v.svc, err = sing_vless.New(v.vs, v.ListenConfig(), tunnel, v.Additions()...)
 	if err != nil {
 		return err
 	}
+	v.l = v.svc
 	log.Infoln("Vless[%s] proxy listening at: %s", v.Name(), v.Address())
+	return nil
+}
+
+// GetUsers implements constant.InboundUserManager.
+func (v *Vless) GetUsers() []C.InboundUser {
+	var users []LC.VlessUser
+	if v.svc != nil {
+		users = v.svc.Users()
+	} else {
+		users = v.vs.Users
+	}
+	result := make([]C.InboundUser, 0, len(users))
+	for _, user := range users {
+		result = append(result, C.InboundUser{
+			Username: user.Username,
+			UUID:     user.UUID,
+			Flow:     user.Flow,
+		})
+	}
+	return result
+}
+
+// SetUsers implements constant.InboundUserManager: the new table takes effect
+// for the next handshake without restarting the listener; removed or re-keyed
+// users are revoked and their connections closed.
+func (v *Vless) SetUsers(users []C.InboundUser) (C.InboundUserChange, error) {
+	if v.svc == nil {
+		return C.InboundUserChange{}, C.ErrInboundNotFound
+	}
+	converted := make([]LC.VlessUser, 0, len(users))
+	for _, user := range users {
+		if user.Username == "" || user.UUID == "" {
+			return C.InboundUserChange{}, C.ErrInvalidInboundUser
+		}
+		if user.Flow != "" && user.Flow != vless.XRV {
+			return C.InboundUserChange{}, C.ErrInvalidInboundUser
+		}
+		converted = append(converted, LC.VlessUser{
+			Username: user.Username,
+			UUID:     user.UUID,
+			Flow:     user.Flow,
+		})
+	}
+	if err := checkVlessUsers(converted); err != nil {
+		return C.InboundUserChange{}, err
+	}
+	return v.svc.UpdateUsers(converted), nil
+}
+
+// checkVlessUsers rejects users that would collide in the table: names that
+// differ only in case (a panel addresses users by email without case), and ids
+// that map to one key. The key is utils.UUIDMap, as in the handshake, so a
+// UUID in another case or a string id equal to another user's is caught.
+func checkVlessUsers(users []LC.VlessUser) error {
+	seen := newVlessUserSet(len(users))
+	for _, user := range users {
+		if err := seen.add(user); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// vlessUserSet holds the names and keys of the users accepted so far.
+type vlessUserSet struct {
+	names map[string]struct{}
+	keys  map[[16]byte]string
+}
+
+func newVlessUserSet(n int) vlessUserSet {
+	return vlessUserSet{names: make(map[string]struct{}, n), keys: make(map[[16]byte]string, n)}
+}
+
+// add accepts user unless its name or key collides with an accepted user.
+func (s vlessUserSet) add(user LC.VlessUser) error {
+	name := strings.ToLower(user.Username)
+	if user.Username != "" {
+		if _, ok := s.names[name]; ok {
+			return fmt.Errorf("%w: duplicate user name %q", C.ErrInvalidInboundUser, user.Username)
+		}
+	}
+	key := utils.UUIDMap(user.UUID)
+	if other, ok := s.keys[key]; ok {
+		return fmt.Errorf("%w: users %q and %q have the same id", C.ErrInvalidInboundUser, other, user.Username)
+	}
+	if user.Username != "" {
+		s.names[name] = struct{}{}
+	}
+	s.keys[key] = user.Username
 	return nil
 }
 

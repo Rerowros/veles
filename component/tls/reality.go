@@ -13,8 +13,11 @@ import (
 	"crypto/x509"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"net"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/metacubex/mihomo/log"
@@ -28,14 +31,172 @@ import (
 
 const RealityMaxShortIDLen = 8
 
+// RealityClientVersion is the Xray-style "x.y.z" version that a REALITY client
+// puts into the first three bytes of the session ID. Xray servers compare it
+// with minClientVer/maxClientVer.
+type RealityClientVersion [3]byte
+
+// DefaultRealityClientVersion is reported when reality-opts.client-version is
+// not set. It represents the tested REALITY compatibility, not Mihomo's
+// application version.
+//
+// Xray-core REALITY servers compare this against minClientVer. Nodes on Xray
+// >= 26.9.8 set minClientVer to 26.9.8 or newer (and such a server rejects a
+// ClientHello without X25519MLKEM768 at all, XTLS/REALITY 8cdf7bf), so the old
+// 26.3.27 default failed every handshake to a refreshed node. 26.10.21 is the
+// newest release tested with this core; older servers do not set maxClientVer,
+// so a newer version is accepted by them.
+var DefaultRealityClientVersion = RealityClientVersion{26, 10, 21}
+
+// ParseRealityClientVersion parses "x.y.z" (each part 0-255).
+func ParseRealityClientVersion(s string) (RealityClientVersion, error) {
+	var v RealityClientVersion
+	parts := strings.Split(s, ".")
+	if len(parts) != len(v) {
+		return v, fmt.Errorf("invalid REALITY client version %q, want x.y.z", s)
+	}
+	for i, part := range parts {
+		n, err := strconv.ParseUint(part, 10, 8)
+		if err != nil {
+			return v, fmt.Errorf("invalid REALITY client version %q, want x.y.z", s)
+		}
+		v[i] = byte(n)
+	}
+	return v, nil
+}
+
 type RealityConfig struct {
 	PublicKey *ecdh.PublicKey
 	ShortID   [RealityMaxShortIDLen]byte
 
 	SupportX25519MLKEM768 bool
+
+	// MLKEMFingerprint replaces the configured client fingerprint for a
+	// handshake that offers X25519MLKEM768 (P7). Some networks treat
+	// ClientHello fingerprints differently, and only chrome, firefox and
+	// safari fingerprints carry the ML-KEM key share. A node that requires
+	// ML-KEM can therefore keep client-fingerprint: chrome and set
+	// mlkem-client-fingerprint: firefox where needed, while other
+	// handshakes stay unchanged.
+	// Nil keeps the configured fingerprint.
+	MLKEMFingerprint *UClientHelloID
+
+	// ClientVersion is reported in the session ID; zero value means DefaultRealityClientVersion.
+	ClientVersion RealityClientVersion
+}
+
+// realityFingerprint picks the ClientHello to send. With X25519MLKEM768 in the
+// handshake an explicit mlkem-client-fingerprint wins; otherwise the configured
+// fingerprint is used.
+func realityFingerprint(useMLKEM bool, fingerprint UClientHelloID, config *RealityConfig) UClientHelloID {
+	if useMLKEM && config.MLKEMFingerprint != nil {
+		return *config.MLKEMFingerprint
+	}
+	return fingerprint
+}
+
+// P6: adaptive X25519MLKEM768. Xray servers are split by generation:
+// builds before 2025 drop a ClientHello with the hybrid key share, builds from
+// 26.9.8 on (XTLS/REALITY 8cdf7bf) reject one without it, and a server never
+// says which it is. Without support-x25519mlkem768 the outcome of each
+// handshake is remembered per server address and public key: classic first
+// (upstream behaviour), flip after one failure, pin after one success, flip a pinned
+// verdict again after realityMemoFlipAfter failures in a row (servers get
+// upgraded). A wrong guess costs one failed connection per server.
+// Adapted from the ClashFest core patch 0002 (Nemu-x, GPL-3.0).
+type realityMemoEntry struct {
+	mlkem    bool
+	pinned   bool
+	failures int
+	flips    int
+}
+
+const realityMemoFlipAfter = 3
+
+var realityMemo = struct {
+	sync.Mutex
+	entries map[string]*realityMemoEntry
+}{entries: map[string]*realityMemoEntry{}}
+
+func realityMemoKey(conn net.Conn, config *RealityConfig) string {
+	key := string(config.PublicKey.Bytes())
+	if addr := conn.RemoteAddr(); addr != nil {
+		key = addr.String() + "|" + key
+	}
+	return key
+}
+
+// realityChooseMLKEM returns whether this handshake offers X25519MLKEM768 and
+// whether the choice came from the memo (and so must be reported back).
+func realityChooseMLKEM(key string, config *RealityConfig) (mlkem bool, adaptive bool) {
+	if config.SupportX25519MLKEM768 {
+		return true, false
+	}
+	realityMemo.Lock()
+	defer realityMemo.Unlock()
+	if entry, ok := realityMemo.entries[key]; ok {
+		return entry.mlkem, true
+	}
+	return false, true
+}
+
+func realityReportMLKEM(key string, mlkem bool, ok bool, remote net.Addr) {
+	realityMemo.Lock()
+	defer realityMemo.Unlock()
+	entry := realityMemo.entries[key]
+	if entry == nil {
+		entry = &realityMemoEntry{mlkem: mlkem}
+		realityMemo.entries[key] = entry
+	}
+	if ok {
+		if !entry.pinned || entry.mlkem != mlkem {
+			log.Infoln("REALITY %v: X25519MLKEM768=%v confirmed", remote, mlkem)
+		}
+		entry.mlkem, entry.pinned, entry.failures, entry.flips = mlkem, true, 0, 0
+		return
+	}
+	if entry.mlkem != mlkem {
+		return // a stale attempt; the memo already moved on
+	}
+	entry.failures++
+	if !entry.pinned || entry.failures >= realityMemoFlipAfter {
+		entry.mlkem, entry.pinned, entry.failures = !mlkem, false, 0
+		entry.flips++
+		// A server that rejects both is down or misconfigured: keep flipping
+		// (it may come back) but stop narrating it after two rounds.
+		if entry.flips <= 2 {
+			log.Infoln("REALITY %v: handshake with X25519MLKEM768=%v failed, next attempt uses %v", remote, mlkem, !mlkem)
+		} else {
+			log.Debugln("REALITY %v: handshake with X25519MLKEM768=%v failed again, next attempt uses %v", remote, mlkem, !mlkem)
+		}
+	}
+}
+
+func realityHasMLKEMShare(uConn *utls.UConn) bool {
+	keys := uConn.HandshakeState.State13.KeyShareKeys
+	return keys != nil && keys.MlkemEcdhe != nil
+}
+
+// ResetRealityMLKEMMemo forgets every learned verdict (tests).
+func ResetRealityMLKEMMemo() {
+	realityMemo.Lock()
+	defer realityMemo.Unlock()
+	realityMemo.entries = map[string]*realityMemoEntry{}
 }
 
 func GetRealityConn(ctx context.Context, conn net.Conn, fingerprint UClientHelloID, serverName string, realityConfig *RealityConfig) (net.Conn, error) {
+	memoKey := realityMemoKey(conn, realityConfig)
+	useMLKEM, adaptive := realityChooseMLKEM(memoKey, realityConfig)
+	report := func(ok bool) {
+		if adaptive {
+			realityReportMLKEM(memoKey, useMLKEM, ok, conn.RemoteAddr())
+		}
+	}
+	// Pick the ML-KEM fingerprint once, before the retry loop: the loop below
+	// substitutes chrome for a fingerprint without the hybrid key share and
+	// retries, and applying the configured ML-KEM fingerprint on every
+	// iteration would undo that and loop forever.
+	fingerprint = realityFingerprint(useMLKEM, fingerprint, realityConfig)
 	for retry := 0; ; retry++ {
 		verifier := &realityVerifier{
 			serverName: serverName,
@@ -55,7 +216,17 @@ func GetRealityConn(ctx context.Context, conn net.Conn, fingerprint UClientHello
 			return nil, err
 		}
 
-		if !realityConfig.SupportX25519MLKEM768 { // for X25519MLKEM768 does not work properly with the old reality server
+		// P6: the memo wants the hybrid share but this fingerprint has none
+		// (edge, ios, android, chrome120...): chrome is the only hello that can
+		// still reach that server. An explicit support-x25519mlkem768 keeps the
+		// configured fingerprint, as before.
+		if useMLKEM && adaptive && !realityHasMLKEMShare(uConn) && fingerprint.Client != utls.HelloChrome_Auto.Client {
+			log.Debugln("REALITY %v: %s fingerprint has no X25519MLKEM768 key share, using chrome", conn.RemoteAddr(), fingerprint.Client)
+			fingerprint = utls.HelloChrome_Auto
+			continue
+		}
+
+		if !useMLKEM { // P6: see adapter/outbound/reality.go
 			err = BuildRemovedX25519MLKEM768HandshakeState(uConn)
 			if err != nil {
 				return nil, err
@@ -71,9 +242,11 @@ func GetRealityConn(ctx context.Context, conn net.Conn, fingerprint UClientHello
 		binary.BigEndian.PutUint64(hello.SessionId, uint64(ntp.Now().Unix()))
 
 		copy(hello.SessionId[8:], realityConfig.ShortID[:])
-		hello.SessionId[0] = 1
-		hello.SessionId[1] = 8
-		hello.SessionId[2] = 2
+		clientVersion := realityConfig.ClientVersion
+		if clientVersion == (RealityClientVersion{}) {
+			clientVersion = DefaultRealityClientVersion
+		}
+		copy(hello.SessionId[:3], clientVersion[:])
 
 		//log.Debugln("REALITY hello.sessionId[:16]: %v", hello.SessionId[:16])
 
@@ -117,16 +290,19 @@ func GetRealityConn(ctx context.Context, conn net.Conn, fingerprint UClientHello
 
 		err = uConn.HandshakeContext(ctx)
 		if err != nil {
+			report(false)
 			return nil, err
 		}
 
 		log.Debugln("REALITY Authentication: %v, AEAD: %T", verifier.verified, aeadCipher)
 
 		if !verifier.verified {
+			report(false)
 			go realityClientFallback(uConn, uConfig.ServerName, fingerprint)
 			return nil, errors.New("REALITY authentication failed")
 		}
 
+		report(true)
 		return uConn, nil
 	}
 }
