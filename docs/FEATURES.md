@@ -6,13 +6,15 @@
 
 | Ключ | Что делает |
 |---|---|
-| `reality-opts.client-version: "x.y.z"` | Версия клиента в REALITY. По умолчанию 26.10.21 |
+| `reality-opts.client-version: "x.y.z"` | Версия клиента в REALITY. По умолчанию 26.11.9 |
 | `reality-opts.mlkem-client-fingerprint` | Отпечаток для рукопожатий с ML-KEM |
 | `fragment-opts` | Нарезка начала TLS-соединения: `packets`, `length`, `delay`, `max-split` |
 | `mux.cool` | Xray Mux и XUDP, только для `type: vless` |
-| `network: xdrive` и `xdrive-opts` | Транспорт xdrive |
+| `network: xdrive` и `xdrive-opts` | Транспорт xdrive. С Xray-core 26.11.9 проверен только режим `local` |
 
 Если у REALITY не задан `support-x25519mlkem768`, ядро само подбирает ML-KEM под каждый сервер. Если `client-fingerprint` пустой, используется `chrome`.
+
+`client-fingerprint: chrome` — это Chrome 155, как у Xray-core с версии 26.11.9. Прежний отпечаток Chrome 133 доступен под именем `chrome133`, новый можно задать и явно: `chrome155`. Обычный Mihomo этих двух имён не знает.
 
 ## Сервер
 
