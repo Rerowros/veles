@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/veles/hero.svg" alt="Veles: ядро на базе Mihomo v1.19.33, 18 улучшений, лицензия GPL-3.0" width="100%">
+  <img src="docs/veles/hero.svg" alt="Veles: ядро на базе Mihomo v1.19.34, 18 улучшений, лицензия GPL-3.0" width="100%">
 </p>
 
 <p align="center">
@@ -18,11 +18,11 @@
 
 <img src="docs/veles/xhttp-upload.svg" alt="Отправка по XHTTP на тестовом сервере при интервале 30 мс: без улучшений 3,4 Мбит/с, Veles 13,2 Мбит/с." width="100%">
 
-<img src="docs/veles/patch-map.svg" alt="18 улучшений поверх Mihomo v1.19.33: маскировка, транспорт и скорость, серверная часть." width="100%">
+<img src="docs/veles/patch-map.svg" alt="18 улучшений поверх Mihomo v1.19.34: маскировка, транспорт и скорость, серверная часть." width="100%">
 
 ## Сравнение с другими ядрами
 
-| | Veles | Mihomo v1.19.33 | Xray-core 26.10.21 |
+| | Veles | Mihomo v1.19.34 | Xray-core 26.11.9 |
 |---|---|---|---|
 | Конфиг в формате Clash, правила и группы | ✓ | ✓ | ✕ свой формат |
 | TUIC, AnyTLS, Mieru | ✓ | ✓ | ✕ |
@@ -52,7 +52,7 @@ go build -tags with_gvisor -trimpath -ldflags "-s -w" -o veles .
 Два отличия от Mihomo, о которых стоит знать заранее:
 
 - без `secret` контроллер на сетевом адресе не запустится. Обойти можно настройкой `external-controller-allow-insecure`;
-- неверное значение в новых ключах обычно даёт ошибку всего конфига, а не пропускается. Исключения описаны в [docs/FEATURES.md](docs/FEATURES.md).
+- неподдерживаемые или конфликтные значения в новых ключах прокси пропускаются с предупреждением в лог, не ломая конфиг. Подробности в [docs/FEATURES.md](docs/FEATURES.md).
 
 Обновление ядра из дашборда (`POST /upgrade`) пока скачивает обычный Mihomo и заменяет им Veles, поэтому им лучше не пользоваться: новые версии берите в [релизах](https://github.com/Rerowros/veles/releases).
 
@@ -63,7 +63,7 @@ go build -tags with_gvisor -trimpath -ldflags "-s -w" -o veles .
 
 ## Авторы и лицензия
 
-Veles выпускается под лицензией [GPL-3.0](LICENSE), как и Mihomo. Это изменённая версия Mihomo v1.19.33, изменения от 4 и 10 ноября 2026 года. Проект не связан с MetaCubeX и XTLS, ошибки этой сборки не надо отправлять авторам Mihomo.
+Veles выпускается под лицензией [GPL-3.0](LICENSE), как и Mihomo. Это изменённая версия Mihomo v1.19.34, изменения от 4, 10 и 11 ноября 2026 года. Проект не связан с MetaCubeX и XTLS, ошибки этой сборки не надо отправлять авторам Mihomo.
 
 Спасибо проектам, код которых здесь использован:
 

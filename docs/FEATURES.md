@@ -1,6 +1,6 @@
 # Новые ключи Veles
 
-Обычный Mihomo эти ключи молча пропускает. Veles на неверное значение обычно отвечает ошибкой всего конфига. Исключение: плохой `fallback-page` не даёт запуститься только этому входу, и видно это при старте.
+Обычный Mihomo эти ключи молча пропускает. Veles на неподдерживаемое или конфликтное значение ключа прокси пишет предупреждение в лог и пропускает только сам ключ, не роняя профиль (как оригинальный Mihomo). Строгая проверка оставлена только у серверных лимитов `user-limits` и `proxy-protocol`; плохой `fallback-page` не даёт запуститься только этому входу при старте.
 
 ## Прокси
 
@@ -9,12 +9,22 @@
 | `reality-opts.client-version: "x.y.z"` | Версия клиента в REALITY. По умолчанию 26.11.9 |
 | `reality-opts.mlkem-client-fingerprint` | Отпечаток для рукопожатий с ML-KEM |
 | `fragment-opts` | Нарезка начала TLS-соединения: `packets`, `length`, `delay`, `max-split` |
-| `mux.cool` | Xray Mux и XUDP, только для `type: vless` |
+| `mux.cool` | Xray Mux и XUDP, только для `type: vless` без `flow: xtls-rprx-vision` |
 | `network: xdrive` и `xdrive-opts` | Транспорт xdrive. С Xray-core 26.11.9 проверен только режим `local` |
 
 Если у REALITY не задан `support-x25519mlkem768`, ядро само подбирает ML-KEM под каждый сервер. Если `client-fingerprint` пустой, используется `chrome`.
 
 `client-fingerprint: chrome` — это Chrome 155, как у Xray-core с версии 26.11.9. Прежний отпечаток Chrome 133 доступен под именем `chrome133`, новый можно задать и явно: `chrome155`. Обычный Mihomo этих двух имён не знает.
+
+## Диагностика подключений
+
+На контроллере добавлен кольцевой журнал последних 256 непрошедших исходящих подключений (TCP и UDP, кроме намеренных правил `REJECT`):
+
+- `GET /connections` — поля `failedTotal` и `failedConnections`;
+- `GET /connections/failed` — снимок JSON (`?limit=N`) или поток WebSocket (`?interval=1000`);
+- `DELETE /connections/failed` — очистка буфера;
+- `GET /events?types=dial.error` — поток событий ошибок дозвона;
+- `GET /metrics` — счётчик `mihomo_dial_failures_total`.
 
 ## Сервер
 
