@@ -125,6 +125,14 @@ func StreamTLSConn(ctx context.Context, conn net.Conn, cfg *TLSConfig) (net.Conn
 			return nil, err
 		}
 		tlsConn := tlsC.UClient(conn, tlsConfig, clientFingerprint)
+		if len(cfg.NextProtos) == 1 && cfg.NextProtos[0] == "http/1.1" {
+			// P27: the fingerprint would still offer ALPN h2 and send ALPS(h2);
+			// when the caller allows only http/1.1 (e.g. XHTTP with
+			// alpn: [http/1.1]), offer http/1.1 only and drop ALPS, as a browser does.
+			if err = tlsC.BuildWebsocketHandshakeState(tlsConn); err != nil {
+				return nil, err
+			}
+		}
 		err = tlsConn.HandshakeContext(ctx)
 		if err != nil {
 			return nil, err

@@ -2,6 +2,7 @@ package http
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net"
 	URL "net/url"
@@ -86,8 +87,43 @@ func HttpRequest(ctx context.Context, url, method string, header map[string][]st
 		TLSClientConfig: tlsConfig,
 	}
 
-	client := http.Client{Transport: transport}
+	client := http.Client{Transport: transport, CheckRedirect: checkRedirect}
 	return client.Do(req)
+}
+
+// maxRedirects is the limit of the default net/http policy.
+const maxRedirects = 10
+
+// checkRedirect keeps the default limit and follows redirects to any host, but
+// never sends Referer (it would carry the previous URL, which may hold a
+// subscription token) and, once the chain has left the original host, drops
+// every X-* header (device id, client version and other custom headers set
+// for the original server). The http client itself only strips Authorization
+// and Cookie, and copies the original headers again on every hop, so the
+// whole chain is checked each time. (P28)
+func checkRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) >= maxRedirects {
+		return errors.New("stopped after 10 redirects")
+	}
+	req.Header.Del("Referer")
+	if len(via) == 0 {
+		return nil
+	}
+	origin := via[0].URL.Hostname()
+	crossHost := !strings.EqualFold(req.URL.Hostname(), origin)
+	for _, r := range via[1:] {
+		if !strings.EqualFold(r.URL.Hostname(), origin) {
+			crossHost = true
+		}
+	}
+	if crossHost {
+		for k := range req.Header {
+			if len(k) >= 2 && strings.EqualFold(k[:2], "x-") {
+				delete(req.Header, k)
+			}
+		}
+	}
+	return nil
 }
 
 type Option func(opt *option)
