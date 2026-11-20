@@ -94,13 +94,28 @@ func HttpRequest(ctx context.Context, url, method string, header map[string][]st
 // maxRedirects is the limit of the default net/http policy.
 const maxRedirects = 10
 
+// keptOnCrossHost are the device headers a subscription panel needs to
+// register the device: the Android app sends them with the subscription
+// download, the panel reads x-hwid and the device description. Old
+// subscription links answer 301 to another domain, and without x-hwid there
+// the panel would treat the device as unknown, so these survive a cross-host
+// redirect. Lower case, compared without regard to case. Never add anything
+// secret (tokens, API keys) here. (P35)
+var keptOnCrossHost = map[string]struct{}{
+	"x-hwid":         {},
+	"x-device-os":    {},
+	"x-ver-os":       {},
+	"x-device-model": {},
+	"x-app-version":  {},
+}
+
 // checkRedirect keeps the default limit and follows redirects to any host, but
 // never sends Referer (it would carry the previous URL, which may hold a
 // subscription token) and, once the chain has left the original host, drops
-// every X-* header (device id, client version and other custom headers set
-// for the original server). The http client itself only strips Authorization
-// and Cookie, and copies the original headers again on every hop, so the
-// whole chain is checked each time. (P28)
+// every X-* header (custom headers set for the original server) except the
+// device headers in keptOnCrossHost (P35). The http client itself only strips
+// Authorization and Cookie, and copies the original headers again on every
+// hop, so the whole chain is checked each time. (P28)
 func checkRedirect(req *http.Request, via []*http.Request) error {
 	if len(via) >= maxRedirects {
 		return errors.New("stopped after 10 redirects")
@@ -118,7 +133,10 @@ func checkRedirect(req *http.Request, via []*http.Request) error {
 	}
 	if crossHost {
 		for k := range req.Header {
-			if len(k) >= 2 && strings.EqualFold(k[:2], "x-") {
+			if len(k) < 2 || !strings.EqualFold(k[:2], "x-") {
+				continue
+			}
+			if _, keep := keptOnCrossHost[strings.ToLower(k)]; !keep {
 				delete(req.Header, k)
 			}
 		}

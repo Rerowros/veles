@@ -124,6 +124,53 @@ func TestVelesVlessDownloadSettingsOwnCertVerify(t *testing.T) {
 	assert.Nil(t, ds.Fingerprint)
 }
 
+// P34: a download channel with its own tlsSettings or SNI does not inherit skip-cert-verify
+// of the main proxy (set by a provider override or the client); only its own
+// tlsSettings.allowInsecure turns verification off.
+func TestVelesVlessDownloadSettingsOwnSkipCertVerify(t *testing.T) {
+	parse := func(extra string) (map[string]any, *outbound.XHTTPDownloadSettings) {
+		t.Helper()
+		link := "vless://11111111-2222-3333-4444-555555555555@example.com:443?security=tls&type=xhttp&sni=front.example&extra=" + url.QueryEscape(extra) + "#n"
+		proxies, err := ConvertsV2Ray([]byte(link))
+		require.NoError(t, err)
+		require.Len(t, proxies, 1)
+		// the main proxy skips verification, as after a provider override "skip-cert-verify: true"
+		proxies[0]["skip-cert-verify"] = true
+		_, err = adapter.ParseProxy(proxies[0])
+		require.NoError(t, err)
+		option := &outbound.VlessOption{}
+		decoder := structure.NewDecoder(structure.Option{TagName: "proxy", WeaklyTypedInput: true, KeyReplacer: structure.DefaultKeyReplacer})
+		require.NoError(t, decoder.Decode(proxies[0], option))
+		require.True(t, option.SkipCertVerify)
+		ds := option.XHTTPOpts.DownloadSettings
+		require.NotNil(t, ds)
+		return proxies[0]["xhttp-opts"].(map[string]any)["download-settings"].(map[string]any), ds
+	}
+
+	// own tlsSettings without allowInsecure: the certificate of dl.example is verified
+	m, ds := parse(`{"downloadSettings":{"address":"dl.example","security":"tls","tlsSettings":{"serverName":"dl.example"}}}`)
+	assert.Equal(t, false, m["skip-cert-verify"])
+	require.NotNil(t, ds.SkipCertVerify, "false must reach the outbound as a set pointer")
+	// the same resolution as adapter/outbound/vless.go (download-settings)
+	assert.False(t, lo.FromPtrOr(ds.SkipCertVerify, true))
+
+	// own reality serverName: not inherited either
+	m, ds = parse(`{"downloadSettings":{"address":"dl.example","security":"reality","realitySettings":{"serverName":"dl.example","publicKey":"ppQ9FwLrLIa0AOrp1WvcyiaQ37vg2WSy_CD4bIdiTUw"}}}`)
+	assert.Equal(t, false, m["skip-cert-verify"])
+	assert.False(t, lo.FromPtrOr(ds.SkipCertVerify, true))
+
+	// own allowInsecure: true is kept
+	m, ds = parse(`{"downloadSettings":{"address":"dl.example","security":"tls","tlsSettings":{"serverName":"dl.example","allowInsecure":true}}}`)
+	assert.Equal(t, true, m["skip-cert-verify"])
+	assert.True(t, lo.FromPtrOr(ds.SkipCertVerify, false))
+
+	// negative: no own tlsSettings and no own SNI - the download channel keeps inheriting the main TLS
+	m, ds = parse(`{"downloadSettings":{"address":"dl.example","security":"tls"}}`)
+	assert.NotContains(t, m, "skip-cert-verify")
+	assert.Nil(t, ds.SkipCertVerify)
+	assert.True(t, lo.FromPtrOr(ds.SkipCertVerify, true))
+}
+
 // P33: like Xray, a pcs/vcn list that is empty after trimming is not imported (verification by SNI).
 func TestVelesEmptyVcnPcsListsNotImported(t *testing.T) {
 	for _, value := range []string{",", " , ", " "} {

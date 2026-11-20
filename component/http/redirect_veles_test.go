@@ -12,6 +12,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/metacubex/http"
 )
 
 // hostDialer sends every "<name>:<port>" to 127.0.0.1:<port>, so test servers
@@ -81,6 +83,7 @@ var deviceHeaders = map[string][]string{
 	"x-device-os":    {"Android"},
 	"x-ver-os":       {"15"},
 	"x-device-model": {"Pixel"},
+	"X-APP-VERSION":  {"1.2.3"},
 	"x-test-fleet":    {"k"},
 	"X-Api-Key":      {"key-1"},
 	"User-Agent":     {"ClashMetaForAndroid/test"},
@@ -100,11 +103,25 @@ func get(t *testing.T, url string) (string, error) {
 	return string(b), err
 }
 
-func assertNoDevice(t *testing.T, h stdhttp.Header) {
+// sentToOtherHost are the deviceHeaders that survive a cross-host redirect (P35).
+var sentToOtherHost = []string{"x-hwid", "x-device-os", "x-ver-os", "x-device-model", "x-app-version"}
+
+// assertOtherHost checks a request on another host: the device headers keep
+// their values, every other X-* header is gone (P28, P35).
+func assertOtherHost(t *testing.T, h stdhttp.Header) {
 	t.Helper()
+	keep := map[string]bool{}
+	for _, k := range sentToOtherHost {
+		keep[k] = true
+	}
 	for k := range h {
-		if strings.HasPrefix(strings.ToLower(k), "x-") {
+		if strings.HasPrefix(strings.ToLower(k), "x-") && !keep[strings.ToLower(k)] {
 			t.Errorf("header %s = %q leaked to the other host", k, h[k])
+		}
+	}
+	for k, v := range deviceHeaders {
+		if keep[strings.ToLower(k)] && h.Get(k) != v[0] {
+			t.Errorf("device header %s = %q on the other host, want %q", k, h.Get(k), v[0])
 		}
 	}
 }
@@ -118,7 +135,7 @@ func assertDevice(t *testing.T, h stdhttp.Header) {
 	}
 }
 
-func TestVelesRedirectOtherHostDropsRefererAndDeviceHeaders(t *testing.T) {
+func TestVelesRedirectOtherHostDropsRefererAndOtherXHeaders(t *testing.T) {
 	var sb seen
 	b := final(&sb)
 	defer b.Close()
@@ -135,7 +152,7 @@ func TestVelesRedirectOtherHostDropsRefererAndDeviceHeaders(t *testing.T) {
 	if ref := h.Get("Referer"); ref != "" {
 		t.Errorf("Referer %q sent to the other host", ref)
 	}
-	assertNoDevice(t, h)
+	assertOtherHost(t, h)
 	if h.Get("User-Agent") != "ClashMetaForAndroid/test" || h.Get("Accept") != "*/*" {
 		t.Errorf("ordinary headers lost: %v", h)
 	}
@@ -176,11 +193,11 @@ func TestVelesRedirectChainOfTwo(t *testing.T) {
 	if err != nil || body != "ok" {
 		t.Fatalf("body %q, err %v", body, err)
 	}
-	assertNoDevice(t, sb.last(t))
+	assertOtherHost(t, sb.last(t))
 	// back on the original host after a foreign hop: the foreign hop chose
-	// this URL, so device headers stay dropped
+	// this URL, so other X-* headers stay dropped; device headers go (P35)
 	h := sc.last(t)
-	assertNoDevice(t, h)
+	assertOtherHost(t, h)
 	if ref := h.Get("Referer"); ref != "" {
 		t.Errorf("Referer %q sent", ref)
 	}
@@ -248,7 +265,7 @@ func TestVelesRedirectOtherHostDropsCallerReferer(t *testing.T) {
 	a := redirector(&sa, func(*stdhttp.Request) string { return "http://b.test:" + port(t, b) + "/cfg" })
 	defer a.Close()
 
-	hdr := map[string][]string{"Referer": {"http://origin.test/page"}, "X-Hwid": {"hwid-1"}}
+	hdr := map[string][]string{"Referer": {"http://origin.test/page"}, "X-Hwid": {"hwid-1"}, "X-Other": {"o"}}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	resp, err := HttpRequest(ctx, "http://a.test:"+port(t, a)+"/sub/SECRET-TOKEN", stdhttp.MethodGet, hdr, nil, WithDialer(hostDialer{}))
@@ -263,5 +280,75 @@ func TestVelesRedirectOtherHostDropsCallerReferer(t *testing.T) {
 	if ref := h.Get("Referer"); ref != "" {
 		t.Errorf("Referer %q sent to the other host", ref)
 	}
-	assertNoDevice(t, h)
+	if h.Get("X-Hwid") != "hwid-1" {
+		t.Errorf("X-Hwid %q on the other host, want hwid-1", h.Get("X-Hwid"))
+	}
+	if v := h.Get("X-Other"); v != "" {
+		t.Errorf("X-Other %q leaked to the other host", v)
+	}
+}
+
+// An old subscription link answers 301 to another domain: the panel there
+// must still get the device headers, but not Referer or other X-*. (P35)
+func TestVelesRedirect301OtherHostKeepsDeviceHeaders(t *testing.T) {
+	var sb seen
+	b := final(&sb)
+	defer b.Close()
+	var sa seen
+	a := httptest.NewServer(stdhttp.HandlerFunc(func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
+		sa.add(r.Header)
+		stdhttp.Redirect(w, r, "http://b.test:"+port(t, b)+"/sub/SECRET-TOKEN", stdhttp.StatusMovedPermanently)
+	}))
+	defer a.Close()
+
+	body, err := get(t, "http://a.test:"+port(t, a)+"/sub/SECRET-TOKEN")
+	if err != nil || body != "ok" {
+		t.Fatalf("body %q, err %v", body, err)
+	}
+	h := sb.last(t)
+	want := map[string]string{
+		"x-hwid":         "hwid-1",
+		"X-Device-Os":    "Android",
+		"X-VER-OS":       "15",
+		"x-device-model": "Pixel",
+		"x-app-version":  "1.2.3",
+	}
+	for k, v := range want {
+		if got := h.Get(k); got != v {
+			t.Errorf("%s = %q on the other host, want %q", k, got, v)
+		}
+	}
+	for _, k := range []string{"X-Api-Key", "X-Fleet-Key", "Referer"} {
+		if v := h.Get(k); v != "" {
+			t.Errorf("%s = %q leaked to the other host", k, v)
+		}
+	}
+}
+
+// checkRedirect compares header names without regard to case, also for keys
+// that were put into the map without canonicalization. (P35)
+func TestVelesCheckRedirectDeviceHeaderNamesAnyCase(t *testing.T) {
+	from, _ := stdhttp.NewRequest(stdhttp.MethodGet, "http://a.test/sub", nil)
+	to, _ := stdhttp.NewRequest(stdhttp.MethodGet, "http://b.test/sub", nil)
+	via := []*http.Request{{URL: from.URL}}
+	req := &http.Request{URL: to.URL, Header: http.Header{
+		"X-HWID":         {"h"},
+		"x-device-model": {"m"},
+		"X-Ver-Os":       {"15"},
+		"x-api-key":      {"k"},
+		"X-AUTH-TOKEN":   {"t"},
+	}}
+	if err := checkRedirect(req, via); err != nil {
+		t.Fatal(err)
+	}
+	for _, k := range []string{"X-HWID", "x-device-model", "X-Ver-Os"} {
+		if _, ok := req.Header[k]; !ok {
+			t.Errorf("%s dropped", k)
+		}
+	}
+	for _, k := range []string{"x-api-key", "X-AUTH-TOKEN"} {
+		if _, ok := req.Header[k]; ok {
+			t.Errorf("%s kept on the other host", k)
+		}
+	}
 }

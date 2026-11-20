@@ -392,6 +392,11 @@ func parseXHTTPExtra(extra map[string]any, opts map[string]any) {
 				if _, ok := ds["name-cert-verify"]; !ok {
 					ds["name-cert-verify"] = ""
 				}
+				// P34: the same for skip-cert-verify, so the download channel verifies its
+				// certificate unless its own tlsSettings.allowInsecure is true
+				if _, ok := ds["skip-cert-verify"]; !ok {
+					ds["skip-cert-verify"] = false
+				}
 			}
 		}
 
