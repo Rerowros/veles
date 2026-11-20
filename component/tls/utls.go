@@ -4,6 +4,8 @@ import (
 	"context"
 	"net"
 	"reflect"
+	"strings"
+	"sync"
 	"unsafe"
 
 	"github.com/metacubex/mihomo/common/once"
@@ -82,13 +84,18 @@ func GetFingerprint(clientFingerprint string) (UClientHelloID, bool) {
 	}
 }
 
-var randomFingerprint = once.OnceValue(func() UClientHelloID {
-	chooser, _ := weightedrand.NewChooser(
-		weightedrand.NewChoice("chrome", 6),
-		weightedrand.NewChoice("safari", 3),
-		weightedrand.NewChoice("ios", 2),
-		weightedrand.NewChoice("firefox", 1),
-	)
+// P29: "random" no longer picks "ios" (iOS 14, no X25519MLKEM768): a REALITY
+// node of Xray >= 26.9.8 rejects such a hello, and the pick lasts until restart.
+var randomFingerprintPool = []weightedrand.Choice[string, int]{
+	weightedrand.NewChoice("chrome", 6),
+	weightedrand.NewChoice("safari", 3),
+	weightedrand.NewChoice("firefox", 1),
+}
+
+var randomFingerprint = once.OnceValue(pickRandomFingerprint)
+
+func pickRandomFingerprint() UClientHelloID {
+	chooser, _ := weightedrand.NewChooser(randomFingerprintPool...)
 	initClient := chooser.Pick()
 	log.Debugln("initial random HelloID:%s", initClient)
 	fingerprint, ok := fingerprints[initClient]
@@ -96,7 +103,38 @@ var randomFingerprint = once.OnceValue(func() UClientHelloID {
 		log.Warnln("error in initial random HelloID:%s", initClient)
 	}
 	return fingerprint
-})
+}
+
+// DefaultClientFingerprint (P29) is the hello of a TLS client to a proxy
+// server without client-fingerprint, as in Xray (empty fingerprint is Chrome).
+const DefaultClientFingerprint = "chrome"
+
+var warnedClientFingerprints sync.Map
+
+// GetClientFingerprint (P29) resolves client-fingerprint of a plain TLS or
+// REALITY connection to a proxy server. The name is trimmed and
+// case-insensitive; empty means DefaultClientFingerprint; an unknown name is
+// logged once and replaced by DefaultClientFingerprint, so a typo does not
+// silently turn into Go crypto/tls. Only "none" returns false: the caller then
+// uses Go crypto/tls. ShadowTLS, JLS, TLSMirror and mlkem-client-fingerprint
+// keep using GetFingerprint with their own rules.
+func GetClientFingerprint(clientFingerprint string) (UClientHelloID, bool) {
+	name := strings.ToLower(strings.TrimSpace(clientFingerprint))
+	switch name {
+	case "":
+		name = DefaultClientFingerprint
+	case "none":
+		return UClientHelloID{}, false
+	default:
+		if _, ok := fingerprints[name]; !ok {
+			if _, warned := warnedClientFingerprints.LoadOrStore(name, struct{}{}); !warned {
+				log.Warnln("unknown client-fingerprint %q, using %q", clientFingerprint, DefaultClientFingerprint)
+			}
+			name = DefaultClientFingerprint
+		}
+	}
+	return GetFingerprint(name)
+}
 
 var fingerprints = map[string]UClientHelloID{
 	"chrome":  HelloChromeAuto, // P20: Chrome 155, as Xray >= 26.11.9

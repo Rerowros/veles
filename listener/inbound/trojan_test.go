@@ -62,6 +62,24 @@ func testInboundTrojan(t *testing.T, inboundOptions inbound.TrojanOption, outbou
 
 func testInboundTrojanTLS(t *testing.T, inboundOptions inbound.TrojanOption, outboundOptions outbound.TrojanOption) {
 	testInboundTrojan(t, inboundOptions, outboundOptions)
+	// P29: without client-fingerprint the client is chrome (uTLS); "none"
+	// keeps Go crypto/tls, so check that path against the server too.
+	t.Run("none", func(t *testing.T) {
+		outboundOptions := outboundOptions
+		outboundOptions.ClientFingerprint = "none"
+		testInboundTrojan(t, inboundOptions, outboundOptions)
+	})
+	t.Run("none+ECH", func(t *testing.T) {
+		inboundOptions := inboundOptions
+		outboundOptions := outboundOptions
+		outboundOptions.ClientFingerprint = "none"
+		inboundOptions.EchKey = echKeyPem
+		outboundOptions.ECHOpts = outbound.ECHOptions{
+			Enable: true,
+			Config: echConfigBase64,
+		}
+		testInboundTrojan(t, inboundOptions, outboundOptions)
+	})
 	t.Run("ECH", func(t *testing.T) {
 		inboundOptions := inboundOptions
 		outboundOptions := outboundOptions

@@ -362,7 +362,8 @@ func streamWebsocketConn(ctx context.Context, conn net.Conn, c *WebsocketConfig,
 			config.ServerName = c.Host
 		}
 
-		if clientFingerprint, ok := tlsC.GetFingerprint(c.ClientFingerprint); ok {
+		// P29: same default as StreamTLSConn: chrome unless client-fingerprint is "none".
+		if clientFingerprint, ok := tlsC.GetClientFingerprint(c.ClientFingerprint); ok {
 			tlsConfig := tlsC.UConfig(config)
 			err = c.ECHConfig.ClientHandleUTLS(ctx, tlsConfig)
 			if err != nil {

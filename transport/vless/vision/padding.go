@@ -23,13 +23,24 @@ const (
 func ApplyPadding(buffer *buf.Buffer, command byte, userUUID *[]byte, paddingTLS bool) {
 	contentLen := int32(buffer.Len())
 	var paddingLen int32
-	if contentLen < 900 {
-		if paddingTLS {
-			//log.Debugln("long padding")
-			paddingLen = randv2.Int32N(500) + 900 - contentLen
-		} else {
-			paddingLen = randv2.Int32N(256)
-		}
+	// P30: as Xray XtlsPadding: long padding below 900 bytes with TLS,
+	// otherwise 0..255 random bytes (also for records of 900 bytes and more),
+	// clamped so a padded frame fits Xray's 8192-byte buffer.
+	if contentLen < 900 && paddingTLS {
+		//log.Debugln("long padding")
+		paddingLen = randv2.Int32N(500) + 900 - contentLen
+	} else {
+		paddingLen = randv2.Int32N(256)
+	}
+	if limit := xrayBufSize - PaddingHeaderLen - contentLen; paddingLen > limit {
+		paddingLen = limit
+	}
+	// P30: never extend past the buffer's real capacity.
+	if free := int32(buffer.FreeLen()); paddingLen > free {
+		paddingLen = free
+	}
+	if paddingLen < 0 {
+		paddingLen = 0
 	}
 
 	binary.BigEndian.PutUint16(buffer.ExtendHeader(2), uint16(paddingLen))

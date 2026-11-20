@@ -5,14 +5,17 @@ import (
 	"fmt"
 
 	"github.com/metacubex/mihomo/component/dialer"
+	"github.com/metacubex/mihomo/component/fragment"
 	"github.com/metacubex/mihomo/component/loopback"
 	"github.com/metacubex/mihomo/component/resolver"
 	C "github.com/metacubex/mihomo/constant"
+	"github.com/metacubex/mihomo/log"
 )
 
 type Direct struct {
 	*Base
 	loopBack *loopback.Detector
+	fragment *fragment.Config // P31: nil when fragment-opts is unset
 }
 
 type DirectOption struct {
@@ -27,7 +30,9 @@ func (d *Direct) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn,
 	}
 	opts := d.DialOptions()
 	opts = append(opts, dialer.WithResolver(resolver.DirectHostResolver))
-	c, err := dialer.DialContext(ctx, "tcp", metadata.RemoteAddress(), opts...)
+	// P31: fragment-opts splits the first TLS ClientHello, as freedom+fragment
+	// in Xray; without it the dialer is used as is.
+	c, err := fragment.NewDialer(dialer.NewDialer(opts...), d.fragment).DialContext(ctx, "tcp", metadata.RemoteAddress())
 	if err != nil {
 		return nil, err
 	}
@@ -65,6 +70,12 @@ func (d *Direct) IsL3Protocol(metadata *C.Metadata) bool {
 }
 
 func NewDirectWithOption(option DirectOption) *Direct {
+	// P31: as BasicOption.NewDialer, an invalid block warns and stays off.
+	fragmentConfig, err := option.FragmentOpts.Parse()
+	if err != nil {
+		log.Warnln("ignore unsupported fragment-opts: %s", err.Error())
+		fragmentConfig = nil
+	}
 	return &Direct{
 		Base: NewBase(BaseOption{
 			Name:         option.Name,
@@ -78,6 +89,7 @@ func NewDirectWithOption(option DirectOption) *Direct {
 			Prefer:       option.IPVersion,
 		}),
 		loopBack: loopback.NewDetector(),
+		fragment: fragmentConfig,
 	}
 }
 

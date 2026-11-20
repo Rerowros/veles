@@ -111,14 +111,18 @@ func StreamTLSConn(ctx context.Context, conn net.Conn, cfg *TLSConfig) (net.Conn
 		return nil, err
 	}
 
-	clientFingerprintName := cfg.ClientFingerprint
-	if cfg.Reality != nil && clientFingerprintName == "" {
-		clientFingerprintName = "chrome"
-	}
-	if clientFingerprint, ok := tlsC.GetFingerprint(clientFingerprintName); ok {
-		if cfg.Reality != nil {
-			return tlsC.GetRealityConn(ctx, conn, clientFingerprint, tlsConfig.ServerName, cfg.Reality)
+	if cfg.Reality != nil {
+		// P29: empty and unknown client-fingerprint mean chrome here as well;
+		// an explicit "none" asks for Go crypto/tls, which REALITY cannot use.
+		clientFingerprint, ok := tlsC.GetClientFingerprint(cfg.ClientFingerprint)
+		if !ok {
+			return nil, errors.New(`REALITY is based on uTLS, client-fingerprint "none" is not supported`)
 		}
+		return tlsC.GetRealityConn(ctx, conn, clientFingerprint, tlsConfig.ServerName, cfg.Reality)
+	}
+	// P29: no client-fingerprint means chrome for plain TLS too, as in Xray, and
+	// an unknown name warns and falls back to chrome; only "none" keeps Go TLS.
+	if clientFingerprint, ok := tlsC.GetClientFingerprint(cfg.ClientFingerprint); ok {
 		tlsConfig := tlsC.UConfig(tlsConfig)
 		err = cfg.ECH.ClientHandleUTLS(ctx, tlsConfig)
 		if err != nil {
@@ -138,9 +142,6 @@ func StreamTLSConn(ctx context.Context, conn net.Conn, cfg *TLSConfig) (net.Conn
 			return nil, err
 		}
 		return tlsConn, nil
-	}
-	if cfg.Reality != nil {
-		return nil, errors.New("REALITY is based on uTLS, please set a client-fingerprint")
 	}
 
 	err = cfg.ECH.ClientHandle(ctx, tlsConfig)

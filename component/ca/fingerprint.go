@@ -6,23 +6,36 @@ import (
 	"crypto/x509"
 	"encoding/hex"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 )
 
-// NewFingerprintVerifier returns a function that verifies whether a certificate's SHA-256 fingerprint matches the given one.
+// NewFingerprintVerifier returns a function that verifies whether a certificate's SHA-256 fingerprint matches one of the given ones.
+// P33: fingerprint may be several comma-separated hashes (Xray pcs); the certificate matches if any of them does.
 func NewFingerprintVerifier(fingerprint string, time func() time.Time) (func(certs []*x509.Certificate, serverName string) error, error) {
-	switch fingerprint {
-	case "chrome", "firefox", "safari", "ios", "android", "edge", "360", "qq", "random", "randomized": // WTF???
-		return nil, fmt.Errorf("`fingerprint` is used for TLS certificate pinning. If you need to specify the browser fingerprint, use `client-fingerprint`")
-	}
-	fingerprint = strings.TrimSpace(strings.Replace(fingerprint, ":", "", -1))
-	fpByte, err := hex.DecodeString(fingerprint)
-	if err != nil {
-		return nil, fmt.Errorf("fingerprint string decode error: %w", err)
-	}
+	var fpBytes [][]byte
+	for _, item := range strings.Split(fingerprint, ",") {
+		item = strings.TrimSpace(item)
+		switch item {
+		case "chrome", "firefox", "safari", "ios", "android", "edge", "360", "qq", "random", "randomized": // WTF???
+			return nil, fmt.Errorf("`fingerprint` is used for TLS certificate pinning. If you need to specify the browser fingerprint, use `client-fingerprint`")
+		}
+		item = strings.TrimSpace(strings.Replace(item, ":", "", -1))
+		if item == "" {
+			continue
+		}
+		fpByte, err := hex.DecodeString(item)
+		if err != nil {
+			return nil, fmt.Errorf("fingerprint string decode error: %w", err)
+		}
 
-	if len(fpByte) != 32 {
+		if len(fpByte) != 32 {
+			return nil, fmt.Errorf("fingerprint string length error,need sha256 fingerprint")
+		}
+		fpBytes = append(fpBytes, fpByte)
+	}
+	if len(fpBytes) == 0 {
 		return nil, fmt.Errorf("fingerprint string length error,need sha256 fingerprint")
 	}
 
@@ -30,7 +43,7 @@ func NewFingerprintVerifier(fingerprint string, time func() time.Time) (func(cer
 		// ssl pining
 		for i, cert := range certs {
 			hash := sha256.Sum256(cert.Raw)
-			if bytes.Equal(fpByte, hash[:]) {
+			if slices.ContainsFunc(fpBytes, func(fpByte []byte) bool { return bytes.Equal(fpByte, hash[:]) }) {
 				if i > 0 {
 					// When the fingerprint matches a non-leaf certificate,
 					// the certificate chain validity is verified using the certificate as the trusted root certificate.

@@ -45,11 +45,13 @@ func SetFingerprint(config *Config, fingerprint string, nameCertVerify string) (
 	}
 	config.InsecureSkipVerify = true
 	config.VerifyConnection = func(state tls.ConnectionState) error {
-		serverName := state.ServerName
 		if nameCertVerify != "" {
-			serverName = nameCertVerify
+			// P33: nameCertVerify may be several comma-separated names (Xray vcn); any of them may match
+			return ca.VerifyAnyName(nameCertVerify, func(name string) error {
+				return verifier(state.PeerCertificates, name)
+			})
 		}
-		return verifier(state.PeerCertificates, serverName)
+		return verifier(state.PeerCertificates, state.ServerName)
 	}
 	return nil
 }

@@ -109,7 +109,10 @@ func GetTLSConfig(opt Option) (tlsConfig *tls.Config, err error) {
 			// https://github.com/golang/go/issues/36736#issuecomment-587925536
 			serverName := state.ServerName
 			if opt.NameCertVerify != "" {
-				serverName = opt.NameCertVerify
+				// P33: NameCertVerify may be several comma-separated names (Xray vcn); any of them may match
+				return VerifyAnyName(opt.NameCertVerify, func(name string) error {
+					return verifier(state.PeerCertificates, name)
+				})
 			}
 			return verifier(state.PeerCertificates, serverName)
 		}

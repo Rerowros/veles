@@ -8,13 +8,21 @@
 |---|---|
 | `reality-opts.client-version: "x.y.z"` | Версия клиента в REALITY. По умолчанию 26.11.9 |
 | `reality-opts.mlkem-client-fingerprint` | Отпечаток для рукопожатий с ML-KEM |
-| `fragment-opts` | Нарезка начала TLS-соединения: `packets`, `length`, `delay`, `max-split` |
+| `fragment-opts` | Нарезка начала TLS-соединения: `packets`, `length`, `delay`, `max-split`. Работает и у `type: direct` |
 | `mux.cool` | Xray Mux и XUDP, только для `type: vless` без `flow: xtls-rprx-vision` |
 | `network: xdrive` и `xdrive-opts` | Транспорт xdrive. С Xray-core 26.11.9 проверен только режим `local` |
 
-Если у REALITY не задан `support-x25519mlkem768`, ядро само подбирает ML-KEM под каждый сервер. Если `client-fingerprint` пустой, используется `chrome`.
+Если у REALITY не задан `support-x25519mlkem768`, ядро само подбирает ML-KEM под каждый сервер.
+
+Если `client-fingerprint` пустой — у REALITY и у обычного TLS (vless, vmess, trojan, WebSocket, gRPC, XHTTP) — используется `chrome` через uTLS, как у Xray-core. Имя отпечатка читается без учёта регистра; неизвестное имя даёт одно предупреждение в лог и `chrome`. `client-fingerprint: none` оставляет стандартный TLS Go (у REALITY это ошибка). `random` выбирает только chrome, safari или firefox.
+
+Vision (`flow: xtls-rprx-vision`) добавляет случайный хвост и к крупным первым пакетам, как Xray-core.
 
 `client-fingerprint: chrome` — это Chrome 155, как у Xray-core с версии 26.11.9. Прежний отпечаток Chrome 133 доступен под именем `chrome133`, новый можно задать и явно: `chrome155`. Обычный Mihomo этих двух имён не знает.
+
+## Импорт ссылок Xray
+
+Новых ключей нет. Из ссылки берутся SNI, отпечаток и ключ REALITY канала скачивания (`downloadSettings`), а также его `pinnedPeerCertSha256` и `verifyPeerCertByName`. `pcs` и `vcn` принимают список через запятую, `vcn` импортируется в `name-cert-verify`.
 
 ## Диагностика подключений
 

@@ -217,8 +217,13 @@ func ConvertsV2Ray(buf []byte) ([]map[string]any, error) {
 				trojan["client-fingerprint"] = fingerprint
 			}
 
-			if pcs := query.Get("pcs"); pcs != "" {
+			// P33: pcs and vcn are comma-separated lists; like Xray, empty elements are dropped
+			// and an empty list is not imported (Xray then verifies by SNI)
+			if pcs, ok := xrayCommaList(query.Get("pcs")); ok {
 				trojan["fingerprint"] = pcs
+			}
+			if vcn, ok := xrayCommaList(query.Get("vcn")); ok {
+				trojan["name-cert-verify"] = vcn
 			}
 
 			proxies = append(proxies, trojan)

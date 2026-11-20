@@ -38,8 +38,13 @@ func handleVShareLink(names map[string]int, url *url.URL, scheme string, proxy m
 		if alpn := query.Get("alpn"); alpn != "" {
 			proxy["alpn"] = strings.Split(alpn, ",")
 		}
-		if pcs := query.Get("pcs"); pcs != "" {
+		// P33: pcs and vcn are comma-separated lists; like Xray, empty elements are dropped
+		// and an empty list is not imported (Xray then verifies by SNI)
+		if pcs, ok := xrayCommaList(query.Get("pcs")); ok {
 			proxy["fingerprint"] = pcs
+		}
+		if vcn, ok := xrayCommaList(query.Get("vcn")); ok {
+			proxy["name-cert-verify"] = vcn
 		}
 	}
 	if sni := query.Get("sni"); sni != "" {
@@ -339,12 +344,24 @@ func parseXHTTPExtra(extra map[string]any, opts map[string]any) {
 				if v, ok := tlsAny["allowInsecure"].(bool); ok && v {
 					ds["skip-cert-verify"] = true
 				}
+				// P33: Xray pinnedPeerCertSha256 (pcs) and verifyPeerCertByName (vcn) of the download channel
+				if pcs, ok := xrayCommaList(tlsAny["pinnedPeerCertSha256"]); ok {
+					ds["fingerprint"] = pcs
+				}
+				if vcn, ok := xrayCommaList(tlsAny["verifyPeerCertByName"]); ok {
+					ds["name-cert-verify"] = vcn
+				}
 			}
 
 			if sec == "reality" {
 				if realityAny, ok := dsAny["realitySettings"].(map[string]any); ok {
 					realityOpts := make(map[string]any)
-					if pk, ok := realityAny["publicKey"].(string); ok && pk != "" {
+					pk, _ := realityAny["publicKey"].(string)
+					// P33: Xray takes realitySettings.password over publicKey when both are set
+					if password, ok := realityAny["password"].(string); ok && password != "" {
+						pk = password
+					}
+					if pk != "" {
 						realityOpts["public-key"] = pk
 					}
 					if sid, ok := realityAny["shortId"].(string); ok && sid != "" {
@@ -353,6 +370,27 @@ func parseXHTTPExtra(extra map[string]any, opts map[string]any) {
 					if len(realityOpts) > 0 {
 						ds["reality-opts"] = realityOpts
 					}
+					// P33: REALITY serverName and fingerprint are in realitySettings, not in tlsSettings
+					if sn, ok := realityAny["serverName"].(string); ok && sn != "" {
+						ds["servername"] = sn
+					}
+					if fp, ok := realityAny["fingerprint"].(string); ok && fp != "" {
+						ds["client-fingerprint"] = fp
+					}
+				}
+			}
+
+			// P33: in Xray downloadSettings has its own streamSettings, so pcs/vcn of the
+			// main link do not apply to it. When the download channel has its own TLS settings or
+			// SNI, set empty values so the outbound does not inherit the main ones.
+			_, ownTLS := dsAny["tlsSettings"].(map[string]any)
+			_, ownSNI := ds["servername"]
+			if ownTLS || ownSNI {
+				if _, ok := ds["fingerprint"]; !ok {
+					ds["fingerprint"] = ""
+				}
+				if _, ok := ds["name-cert-verify"]; !ok {
+					ds["name-cert-verify"] = ""
 				}
 			}
 		}
@@ -501,4 +539,32 @@ func fragmentOptsFromFinalMask(fm string) map[string]any {
 		return opts
 	}
 	return nil
+}
+
+// xrayCommaList normalizes an Xray comma-separated list (pcs, vcn) given as a string or a JSON
+// array: elements are trimmed and empty ones dropped, as Xray does. ok is false when no element is left.
+// P33.
+func xrayCommaList(value any) (list string, ok bool) {
+	var items []string
+	add := func(s string) {
+		for _, item := range strings.Split(s, ",") {
+			if item = strings.TrimSpace(item); item != "" {
+				items = append(items, item)
+			}
+		}
+	}
+	switch v := value.(type) {
+	case string:
+		add(v)
+	case []any:
+		for _, a := range v {
+			if s, isString := a.(string); isString {
+				add(s)
+			}
+		}
+	}
+	if len(items) == 0 {
+		return "", false
+	}
+	return strings.Join(items, ","), true
 }

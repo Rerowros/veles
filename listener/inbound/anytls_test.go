@@ -100,6 +100,8 @@ func testInboundAnyTLSUTLS(t *testing.T, inboundOptions inbound.AnyTLSOption, ou
 	t.Parallel()
 	t.Run("Conn", func(t *testing.T) {
 		inboundOptions, outboundOptions := inboundOptions, outboundOptions // don't modify outside options value
+		// P29: Go crypto/tls, the default is chrome now
+		outboundOptions.ClientFingerprint = "none"
 		testInboundAnyTLS(t, inboundOptions, outboundOptions)
 	})
 	t.Run("UConn", func(t *testing.T) {
