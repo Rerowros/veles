@@ -26,6 +26,15 @@
 - `GET /events?types=dial.error` — поток событий ошибок дозвона;
 - `GET /metrics` — счётчик `mihomo_dial_failures_total`.
 
+## Телефоны
+
+Новых ключей нет, ядро само ведёт себя бережнее к батарее и памяти:
+
+- на iOS, как и на Android, не шлёт TCP keepalive, что бы ни стояло в `disable-keep-alive`;
+- на iOS hysteria, hysteria2 и tuic не шлют QUIC-пинг каждые 10 секунд; явный `heartbeat-interval` у tuic по-прежнему работает;
+- счётчик скорости засыпает через 5 секунд без трафика и просыпается от первого байта;
+- в сборке с тегом `with_low_memory` окна приёма QUIC (hysteria, hysteria2, tuic, shadowquic) ограничены 2 МБ на поток и 4 МБ на соединение.
+
 ## Сервер
 
 | Ключ | Что делает |

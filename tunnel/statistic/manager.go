@@ -3,6 +3,7 @@ package statistic
 import (
 	"os"
 	"sync"
+	stdatomic "sync/atomic"
 	"time"
 
 	"github.com/metacubex/mihomo/common/atomic"
@@ -25,8 +26,12 @@ func init() {
 		pid:           int32(os.Getpid()),
 	}
 
-	go DefaultManager.handle()
+	go DefaultManager.handle(time.Second)
 }
+
+// idleTicksToPark is how many ticks without a byte either way put the speed
+// counter to sleep (P26).
+const idleTicksToPark = 5
 
 type Manager struct {
 	connections   xsync.Map[string, Tracker]
@@ -44,6 +49,12 @@ type Manager struct {
 	failedLimit   int
 	pid           int32
 	memory        uint64
+
+	// P26: the speed ticker sleeps while no traffic moves. parked is read on
+	// every Push*; parkMu orders park/unpark and guards resumed.
+	parked  stdatomic.Bool
+	parkMu  sync.Mutex
+	resumed chan struct{} // closed when traffic resumes after a park
 }
 
 func (m *Manager) Join(c Tracker) {
@@ -88,11 +99,30 @@ func (m *Manager) CloseByUser(inbound, user string) int {
 func (m *Manager) PushUploaded(size int64) {
 	m.uploadTemp.Add(size)
 	m.uploadTotal.Add(size)
+	if size > 0 && m.parked.Load() { // EOF and deadline reads push 0
+		m.unpark()
+	}
 }
 
 func (m *Manager) PushDownloaded(size int64) {
 	m.downloadTemp.Add(size)
 	m.downloadTotal.Add(size)
+	if size > 0 && m.parked.Load() { // EOF and deadline reads push 0
+		m.unpark()
+	}
+}
+
+// Resumed returns a channel that is closed when traffic moves again, or nil
+// while the speed counter is running. A periodic consumer of the counters
+// (the app's own statistics loop) can sleep on it instead of ticking through
+// idle time: if ch := Resumed(); ch != nil { <-ch }.
+func (m *Manager) Resumed() <-chan struct{} {
+	m.parkMu.Lock()
+	defer m.parkMu.Unlock()
+	if !m.parked.Load() {
+		return nil
+	}
+	return m.resumed
 }
 
 func (m *Manager) Now() (up int64, down int64) {
@@ -143,13 +173,54 @@ func (m *Manager) ResetStatistic() {
 	m.ClearFailed()
 }
 
-func (m *Manager) handle() {
-	ticker := time.NewTicker(time.Second)
-
+// handle turns the byte counts of every interval into the current speed
+// (Now). After idleTicksToPark intervals without traffic it stops the ticker
+// and waits for the next Push*: a ticker that fires every second forever keeps
+// a phone's CPU and the Go scheduler from sleeping (P26). The speed reads
+// 0 while parked, which is what it is.
+func (m *Manager) handle(interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	idle := 0
 	for range ticker.C {
-		m.uploadBlip.Store(m.uploadTemp.Swap(0))
-		m.downloadBlip.Store(m.downloadTemp.Swap(0))
+		up, down := m.uploadTemp.Swap(0), m.downloadTemp.Swap(0)
+		m.uploadBlip.Store(up)
+		m.downloadBlip.Store(down)
+		if up != 0 || down != 0 {
+			idle = 0
+			continue
+		}
+		if idle++; idle < idleTicksToPark {
+			continue
+		}
+		ticker.Stop()
+		m.park()
+		idle = 0
+		ticker.Reset(interval)
 	}
+}
+
+// park blocks until traffic moves.
+func (m *Manager) park() {
+	m.parkMu.Lock()
+	resumed := make(chan struct{})
+	m.resumed = resumed
+	m.parked.Store(true)
+	m.parkMu.Unlock()
+	// A Push that read parked before the Store above counted its bytes before
+	// that too, so they show up here; a later Push sees parked and wakes us.
+	if m.uploadTemp.Load() != 0 || m.downloadTemp.Load() != 0 {
+		m.unpark()
+	}
+	<-resumed
+}
+
+func (m *Manager) unpark() {
+	m.parkMu.Lock()
+	if m.parked.Load() {
+		m.parked.Store(false)
+		close(m.resumed)
+	}
+	m.parkMu.Unlock()
 }
 
 type Snapshot struct {

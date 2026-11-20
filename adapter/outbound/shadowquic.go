@@ -156,6 +156,8 @@ func NewShadowQuic(option ShadowQuicOption) (*ShadowQuic, error) {
 		quicConfig.InitialConnectionReceiveWindow = tuic.DefaultConnectionReceiveWindow / 10
 		quicConfig.MaxConnectionReceiveWindow = tuic.DefaultConnectionReceiveWindow
 	}
+	capQUICReceiveWindowFields(&quicConfig.InitialStreamReceiveWindow, &quicConfig.MaxStreamReceiveWindow,
+		&quicConfig.InitialConnectionReceiveWindow, &quicConfig.MaxConnectionReceiveWindow) // P26
 
 	outbound := &ShadowQuic{
 		Base: NewBase(BaseOption{

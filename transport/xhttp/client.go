@@ -401,6 +401,8 @@ func NewTransport(dialRaw DialRawFunc, wrapTLS WrapTLSFunc, dialQUIC DialQUICFun
 			return wrapped, nil
 		},
 		IdleConnTimeout: ConnIdleTimeout,
+		// P25: strictly 1 physical TCP/TLS conn per H2 slot during cold-start bursts
+		MaxConnsPerHost: 1,
 		Protocols:       protocols,
 		HTTP2: &http.HTTP2Config{
 			SendPingTimeout: keepAlivePeriod,

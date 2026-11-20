@@ -158,8 +158,10 @@ func NewTuic(option TuicOption) (*Tuic, error) {
 		option.RequestTimeout = 8000
 	}
 
+	keepAlive := time.Duration(option.HeartbeatInterval) * time.Millisecond
 	if option.HeartbeatInterval <= 0 {
 		option.HeartbeatInterval = 10000
+		keepAlive = quicKeepAlive(10 * time.Second) // P26: an explicit heartbeat-interval stays
 	}
 
 	udpRelayMode := tuic.QUIC
@@ -203,7 +205,7 @@ func NewTuic(option TuicOption) (*Tuic, error) {
 		MaxConnectionReceiveWindow:     uint64(option.ReceiveWindow),
 		MaxIncomingStreams:             quicMaxOpenStreams,
 		MaxIncomingUniStreams:          quicMaxOpenStreams,
-		KeepAlivePeriod:                time.Duration(option.HeartbeatInterval) * time.Millisecond,
+		KeepAlivePeriod:                keepAlive,
 		DisablePathMTUDiscovery:        option.DisableMTUDiscovery,
 		MaxDatagramFrameSize:           int64(option.MaxDatagramFrameSize),
 		EnableDatagrams:                true,
@@ -216,6 +218,7 @@ func NewTuic(option TuicOption) (*Tuic, error) {
 		quicConfig.InitialConnectionReceiveWindow = tuic.DefaultConnectionReceiveWindow / 10
 		quicConfig.MaxConnectionReceiveWindow = tuic.DefaultConnectionReceiveWindow
 	}
+	capQUICReceiveWindows(quicConfig) // P26
 
 	if len(option.Ip) > 0 {
 		addr = net.JoinHostPort(option.Ip, strconv.Itoa(option.Port))

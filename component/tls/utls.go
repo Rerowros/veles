@@ -277,26 +277,39 @@ func UConfig(config *tls.Config) *utls.Config {
 	return cfg
 }
 
-// BuildWebsocketHandshakeState it will only send http/1.1 in its ALPN.
-// Copy from https://github.com/XTLS/Xray-core/blob/main/transport/internet/tls/tls.go
+// BuildWebsocketHandshakeState sets ALPN to http/1.1 only and strips ALPS extensions.
+// Real browsers do not send ALPS(h2) when negotiating only http/1.1 for WebSocket.
 func BuildWebsocketHandshakeState(c *UConn) error {
 	// Build the handshake state. This will apply every variable of the TLS of the
 	// fingerprint in the UConn
 	if err := c.BuildHandshakeState(); err != nil {
 		return err
 	}
-	// Iterate over extensions and check for utls.ALPNExtension
 	hasALPNExtension := false
+	extensions := c.Extensions[:0]
 	for _, extension := range c.Extensions {
-		if alpn, ok := extension.(*utls.ALPNExtension); ok {
+		switch ext := extension.(type) {
+		case *utls.ALPNExtension:
 			hasALPNExtension = true
-			alpn.AlpnProtocols = []string{"http/1.1"}
-			break
+			ext.AlpnProtocols = []string{"http/1.1"}
+			extensions = append(extensions, ext)
+		case *utls.ApplicationSettingsExtension, *utls.ApplicationSettingsExtensionNew:
+			// P24: drop ALPS extensions when forcing http/1.1 for WebSocket.
+			// Sending ALPS(h2) alongside ALPN(http/1.1) is an impossible browser fingerprint.
+			continue
+		case *utls.GenericExtension:
+			if ext.Id == 17513 || ext.Id == 17613 {
+				continue
+			}
+			extensions = append(extensions, ext)
+		default:
+			extensions = append(extensions, extension)
 		}
 	}
 	if !hasALPNExtension { // Append extension if doesn't exists
-		c.Extensions = append(c.Extensions, &utls.ALPNExtension{AlpnProtocols: []string{"http/1.1"}})
+		extensions = append(extensions, &utls.ALPNExtension{AlpnProtocols: []string{"http/1.1"}})
 	}
+	c.Extensions = extensions
 	// Rebuild the client hello
 	if err := c.BuildHandshakeState(); err != nil {
 		return err

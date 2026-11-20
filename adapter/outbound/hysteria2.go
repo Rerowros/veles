@@ -204,6 +204,7 @@ func NewHysteria2(option Hysteria2Option) (*Hysteria2, error) {
 		InitialConnectionReceiveWindow: option.InitialConnectionReceiveWindow,
 		MaxConnectionReceiveWindow:     option.MaxConnectionReceiveWindow,
 	}
+	capQUICReceiveWindows(quicConfig) // P26
 
 	clientOptions := hysteria2.ClientOptions{
 		Context:            context.TODO(),
@@ -225,6 +226,11 @@ func NewHysteria2(option Hysteria2Option) (*Hysteria2, error) {
 			err := echConfig.ClientHandle(ctx, tlsCfg)
 			if err != nil {
 				return nil, nil, err
+			}
+			if quicKeepAliveOff {
+				// P26: sing-quic turns 0 into its 10 s default before the dial; undo it here
+				// (hysteria2 has no option for it).
+				cfg.KeepAlivePeriod = 0
 			}
 			return common.DialQuic(ctx, addr, outbound.DialOptions(), dialer, tlsCfg, cfg, common.DialQuicOption{Early: early})
 		}),
