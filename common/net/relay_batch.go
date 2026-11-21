@@ -6,6 +6,8 @@ import (
 	"net"
 	"syscall"
 
+	"github.com/metacubex/mihomo/constant/features"
+
 	"github.com/metacubex/sing/common"
 	"github.com/metacubex/sing/common/buf"
 	"github.com/metacubex/sing/common/bufio"
@@ -23,6 +25,13 @@ import (
 // connection holds none.
 const readAheadBuffers = 8
 
+// relayBatch turns the batched copy on. It is off unless the binary is built
+// with with_relay_batch (P36): the batch only pays off when the relay is
+// CPU-bound (several Gbit/s, a loaded node). On a client up to 1 Gbit/s it gave
+// the same speed for about 90 KiB more per active connection and 30-40% more
+// CPU per gigabyte. A variable so that tests cover both paths.
+var relayBatch = features.WithRelayBatch
+
 // errHandBack ends a read-ahead: the reader saw the burst end and leaves the
 // source to the copy loop again.
 var errHandBack = errors.New("read-ahead handed back")
@@ -32,7 +41,7 @@ var errHandBack = errors.New("read-ahead handed back")
 // not a socket (it goes through copyAdaptive, a decrypting or decoding
 // connection), and buffers may be held ahead.
 func batchWriter(destination io.Writer) network.VectorisedWriter {
-	if common.LowMemory {
+	if common.LowMemory || !relayBatch {
 		return nil
 	}
 	switch upstream := network.UnwrapWriter(destination).(type) {

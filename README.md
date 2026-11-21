@@ -47,6 +47,8 @@ go build -tags with_gvisor -trimpath -ldflags "-s -w" -o veles .
 ./veles -d ./config-dir
 ```
 
+Для сервера, где важна пакетная отправка в relay, добавьте тег: `-tags with_gvisor,with_relay_batch`.
+
 Настройки те же, что у Mihomo: [документация Mihomo](https://wiki.metacubex.one). Новые ключи описаны в [docs/FEATURES.md](docs/FEATURES.md).
 
 Два отличия от Mihomo, о которых стоит знать заранее:
@@ -63,7 +65,7 @@ go build -tags with_gvisor -trimpath -ldflags "-s -w" -o veles .
 
 ## Авторы и лицензия
 
-Veles выпускается под лицензией [GPL-3.0](LICENSE), как и Mihomo. Это изменённая версия Mihomo v1.19.34, изменения от 4, 10, 11, 14 и 20 ноября 2026 года. Проект не связан с MetaCubeX и XTLS, ошибки этой сборки не надо отправлять авторам Mihomo.
+Veles выпускается под лицензией [GPL-3.0](LICENSE), как и Mihomo. Это изменённая версия Mihomo v1.19.34, изменения от 4, 10, 11, 14, 20 и 21 ноября 2026 года. Проект не связан с MetaCubeX и XTLS, ошибки этой сборки не надо отправлять авторам Mihomo.
 
 Спасибо проектам, код которых здесь использован:
 

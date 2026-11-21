@@ -58,6 +58,8 @@ Vision (`flow: xtls-rprx-vision`) добавляет случайный хвос
 | `listeners[].xdrive-config` | Вход xdrive |
 | `xray-api.listen` | gRPC API, совместимый с Xray |
 | `user-limits` | Список лимитов. В каждой записи обязательны `inbound` и `user`, дальше `max-conns`, `max-ips`, `up-bps`, `down-bps`, `quota`, `expire-at` |
+
+Пакетная отправка в relay (чтение наперёд и одна запись `writev` на пачку) включается только тегом сборки `with_relay_batch`. Она ускоряет relay, когда он упирается в процессор (несколько Гбит/с, нагруженный сервер); на клиенте до 1 Гбит/с скорость та же, а памяти и процессора уходит больше. Выпуски собраны без этого тега.
 | `metrics.enable`, `metrics.per-user` | `/metrics` в формате Prometheus |
 | `health-without-auth` | `/healthz` и `/readyz` без авторизации |
 | `external-controller-allow-insecure` | Контроллер на сетевом адресе без `secret` |

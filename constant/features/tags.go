@@ -22,5 +22,8 @@ func Tags() (tags []string) {
 	if WithGVisor {
 		tags = append(tags, "with_gvisor")
 	}
+	if WithRelayBatch {
+		tags = append(tags, "with_relay_batch")
+	}
 	return
 }
